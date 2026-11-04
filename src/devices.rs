@@ -63,6 +63,10 @@ pub struct CaptureDevice {
 pub fn list() -> Result<Vec<CaptureDevice>, String> {
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Video/Source"), None);
+    // On Linux the PipeWire provider hides the plain V4L2 one by default, but PipeWire
+    // doesn't pass every format through (the 4K X loses its 10-bit P010 modes).
+    // Show both and keep the richer copy of each device below.
+    monitor.set_show_all_devices(true);
     monitor
         .start()
         .map_err(|e| format!("could not start the device monitor: {e}"))?;
@@ -90,15 +94,15 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
         let path = get(&["api.v4l2.path", "device.path", "object.path"]);
         let mut vendor = get(&["device.vendor.id", "api.v4l2.cap.vendor"]).map(norm_id);
         let mut product = get(&["device.product.id"]).map(norm_id);
-        let serial = get(&["device.serial"]);
+        let mut serial = get(&["device.serial"]);
 
-        // Some setups don't put USB IDs in the properties; read them from sysfs instead.
-        if vendor.is_none() {
-            if let Some(p) = &path {
-                let (v, pr) = usb_ids_from_sysfs(p);
-                vendor = v;
-                product = product.or(pr);
-            }
+        // Fill in anything the properties left out from sysfs.
+        if let Some(p) = &path {
+            let (v, pr, se) = usb_ids_from_sysfs(p);
+            vendor = vendor.or(v);
+            product = product.or(pr);
+            // sysfs has the bare serial; the udev property adds vendor and model.
+            serial = se.or(serial);
         }
 
         let modes = dev.caps().map(|c| modes_from_caps(&c)).unwrap_or_default();
@@ -114,18 +118,7 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
             }
         }
 
-        // The same card can show up once per device provider (V4L2 and PipeWire).
-        // Keep the first one per path, or per name when there's no path.
-        let dup = out.iter().any(|d| match (&d.path, &path) {
-            (Some(a), Some(b)) => a == b,
-            _ => d.name == name && d.modes == modes,
-        });
-        if dup {
-            log::debug(&format!("  skipping duplicate of {name}"));
-            continue;
-        }
-
-        out.push(CaptureDevice {
+        let entry = CaptureDevice {
             name,
             path,
             vendor_id: vendor,
@@ -133,7 +126,27 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
             serial,
             is_elgato,
             modes,
+        };
+
+        // The same card can show up once per device provider (V4L2 and PipeWire).
+        // Keep whichever copy reports more modes.
+        let existing = out.iter().position(|d| match (&d.path, &entry.path) {
+            (Some(a), Some(b)) => a == b,
+            _ => d.name == entry.name,
         });
+        match existing {
+            Some(i) if entry.modes.len() > out[i].modes.len() => {
+                log::debug(&format!(
+                    "  replacing earlier copy of {} ({} modes) with this one ({} modes)",
+                    entry.name,
+                    out[i].modes.len(),
+                    entry.modes.len()
+                ));
+                out[i] = entry;
+            }
+            Some(_) => log::debug(&format!("  skipping duplicate of {}", entry.name)),
+            None => out.push(entry),
+        }
     }
 
     // Elgato cards first, then everything else.
@@ -147,24 +160,33 @@ fn norm_id(s: String) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn usb_ids_from_sysfs(dev_path: &str) -> (Option<String>, Option<String>) {
-    // /dev/video0 -> /sys/class/video4linux/video0/device is the USB interface;
-    // the parent directory holds idVendor / idProduct.
+type UsbIds = (Option<String>, Option<String>, Option<String>);
+
+/// Vendor ID, product ID and serial number of the USB device behind /dev/videoN.
+#[cfg(target_os = "linux")]
+fn usb_ids_from_sysfs(dev_path: &str) -> UsbIds {
+    // /sys/class/video4linux/video0/device is the USB interface; its parent
+    // directory is the USB device, which holds idVendor, idProduct and serial.
     let Some(node) = dev_path.strip_prefix("/dev/") else {
-        return (None, None);
+        return (None, None, None);
     };
     let base = format!("/sys/class/video4linux/{node}/device/..");
     let read = |f: &str| {
         std::fs::read_to_string(format!("{base}/{f}"))
             .ok()
-            .map(|s| norm_id(s))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     };
-    (read("idVendor"), read("idProduct"))
+    (
+        read("idVendor").map(norm_id),
+        read("idProduct").map(norm_id),
+        read("serial"),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn usb_ids_from_sysfs(_dev_path: &str) -> (Option<String>, Option<String>) {
-    (None, None)
+fn usb_ids_from_sysfs(_dev_path: &str) -> UsbIds {
+    (None, None, None)
 }
 
 /// Turn GStreamer caps into a sorted, de-duplicated list of modes.
@@ -179,9 +201,14 @@ pub fn modes_from_caps(caps: &gst::CapsRef) -> Vec<Mode> {
                 continue;
             }
         };
-        let (Ok(width), Ok(height)) = (s.get::<i32>("width"), s.get::<i32>("height")) else {
+        // GStreamer merges caps entries that differ in one field, so width or height
+        // can be a list ({ 640, 720 }) instead of a single number.
+        let widths = int_values(s, "width");
+        let heights = int_values(s, "height");
+        if widths.is_empty() || heights.is_empty() {
+            log::debug(&format!("  skipping caps entry without fixed sizes: {s}"));
             continue;
-        };
+        }
         let formats: Vec<String> = match kind {
             Kind::Mjpeg => vec![String::new()],
             Kind::Lossless => string_or_list(s, "format"),
@@ -190,19 +217,33 @@ pub fn modes_from_caps(caps: &gst::CapsRef) -> Vec<Mode> {
             if num == 0 {
                 continue;
             }
-            for f in &formats {
-                set.insert(Mode {
-                    kind: kind.clone(),
-                    width,
-                    height,
-                    fps_num: num,
-                    fps_den: den,
-                    format: f.clone(),
-                });
+            for &width in &widths {
+                for &height in &heights {
+                    for f in &formats {
+                        set.insert(Mode {
+                            kind: kind.clone(),
+                            width,
+                            height,
+                            fps_num: num,
+                            fps_den: den,
+                            format: f.clone(),
+                        });
+                    }
+                }
             }
         }
     }
     set.into_iter().collect()
+}
+
+fn int_values(s: &gst::StructureRef, field: &str) -> Vec<i32> {
+    if let Ok(v) = s.get::<i32>(field) {
+        return vec![v];
+    }
+    if let Ok(list) = s.get::<gst::List>(field) {
+        return list.iter().filter_map(|v| v.get::<i32>().ok()).collect();
+    }
+    Vec::new()
 }
 
 fn string_or_list(s: &gst::StructureRef, field: &str) -> Vec<String> {
@@ -254,6 +295,19 @@ mod tests {
         assert_eq!(modes.iter().filter(|m| m.kind == Kind::Mjpeg).count(), 2);
         assert!(modes.iter().any(|m| m.ten_bit() && m.fps_num == 60));
         assert!(modes.iter().any(|m| (m.fps() - 59.94).abs() < 0.01));
+    }
+
+    #[test]
+    fn expands_merged_sizes() {
+        gst::init().unwrap();
+        let caps: gst::Caps = "video/x-raw, format=(string)NV12, width=(int){ 640, 720 }, \
+            height=(int)480, framerate=(fraction){ 60/1, 30/1 }"
+            .parse()
+            .unwrap();
+        let modes = modes_from_caps(&caps);
+        assert_eq!(modes.len(), 4);
+        assert!(modes.iter().any(|m| m.width == 640));
+        assert!(modes.iter().any(|m| m.width == 720));
     }
 
     #[test]
