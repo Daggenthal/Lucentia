@@ -38,6 +38,18 @@ fn main() {
         || std::env::var("LUCENTIA_DEBUG").is_ok_and(|v| v != "0");
     log::init_debug(debug);
 
+    // The OpenGL preview window opens tiny and can't be resized when GStreamer picks
+    // its Wayland window. Its X11 window (through XWayland) sizes itself to the video,
+    // so use that when an X display exists. Set GST_GL_WINDOW yourself to override.
+    // This must happen before GStreamer starts any threads.
+    if cfg!(target_os = "linux")
+        && std::env::var_os("GST_GL_WINDOW").is_none()
+        && std::env::var_os("DISPLAY").is_some()
+    {
+        std::env::set_var("GST_GL_WINDOW", "x11");
+        log::debug("using the X11 OpenGL window for the preview");
+    }
+
     if let Err(e) = gst::init() {
         log::error(&format!("GStreamer failed to start: {e}"));
         std::process::exit(1);
