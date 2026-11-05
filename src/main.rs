@@ -316,6 +316,8 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
         test_source: false,
         record: true,
         frames: None,
+        listen_muted: false,
+        mic_muted: false,
     };
     let mut index = 1usize;
     let mbps = |v: &str, flag: &str| -> u32 {

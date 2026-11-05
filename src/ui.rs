@@ -38,6 +38,7 @@ struct RateChoice {
 
 struct Running {
     stop: StopHandle,
+    controls: record::Controls,
     recording: bool,
     generation: u64,
 }
@@ -55,8 +56,12 @@ struct State {
     /// What to start once the running session has ended.
     pending: Option<bool>,
     generation: u64,
-    /// Game audio settings the current preview was started with.
-    preview_audio: (bool, i32),
+    /// Recordings still being finished (mixed, converted) in the background.
+    finishing: u32,
+    /// When the recording last restarted itself after a signal drop.
+    auto_restarts: Vec<std::time::Instant>,
+    /// Session threads, waited for on exit so no recording is cut off.
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
@@ -101,7 +106,9 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         running: None,
         pending: None,
         generation: 0,
-        preview_audio: (true, 100),
+        finishing: 0,
+        auto_restarts: Vec::new(),
+        workers: Vec::new(),
     }));
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -158,12 +165,32 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         ui.on_settings_changed(move || {
             let ui = w.unwrap();
             refresh_estimate(&ui, &s);
-            // Game audio plays during the preview, so a change there restarts it.
-            let now = (ui.get_game_audio(), ui.get_game_volume().round() as i32);
-            let changed = s.borrow().preview_audio != now;
+        });
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        // Turning game audio on or off adds or removes it from the preview.
+        ui.on_game_audio_toggled(move || {
+            let ui = w.unwrap();
+            refresh_estimate(&ui, &s);
             let idle = s.borrow().running.as_ref().is_none_or(|r| !r.recording);
-            if changed && idle {
+            if idle {
                 restart(&ui, &s, false);
+            }
+        });
+    }
+    {
+        // Volume and mute change live, without restarting anything.
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_audio_levels_changed(move || {
+            let ui = w.unwrap();
+            if let Some(r) = &s.borrow().running {
+                r.controls
+                    .set_game_volume(ui.get_game_volume().round() as f64);
+                r.controls
+                    .set_mic_volume(ui.get_mic_volume().round() as f64);
+                r.controls.set_listen_muted(ui.get_listen_muted());
+                r.controls.set_mic_muted(ui.get_mic_muted());
             }
         });
     }
@@ -210,11 +237,17 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
     restart(&ui, &state, false);
     ui.run().map_err(|e| e.to_string())?;
 
-    // Window closed: finish whatever is running so a recording is never cut off.
+    // Window closed: stop whatever is running and wait for every session to finish
+    // its file, so a recording is never cut off.
     if let Some(r) = state.borrow_mut().running.take() {
         r.stop.stop();
-        // The worker thread finishes the file; give it time before the process exits.
-        std::thread::sleep(Duration::from_millis(500));
+    }
+    let workers = std::mem::take(&mut state.borrow_mut().workers);
+    if !workers.is_empty() {
+        log::debug("waiting for recordings to finish before exiting");
+    }
+    for w in workers {
+        let _ = w.join();
     }
     Ok(())
 }
@@ -404,6 +437,8 @@ fn options(ui: &AppWindow, s: &State, record_on: bool) -> Option<record::Options
         test_source: s.test_source,
         record: record_on,
         frames: None,
+        listen_muted: ui.get_listen_muted(),
+        mic_muted: ui.get_mic_muted(),
     })
 }
 
@@ -488,7 +523,7 @@ fn restart(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
         r.stop.stop();
     }
     if state.borrow().running.is_some() {
-        // Start it once the current session has ended (see `ended`).
+        // Start it once the current session has let go of the card (see `released`).
         state.borrow_mut().pending = Some(record_on);
         return;
     }
@@ -524,7 +559,6 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
     let generation = {
         let mut s = state.borrow_mut();
         s.generation += 1;
-        s.preview_audio = (ui.get_game_audio(), ui.get_game_volume().round() as i32);
         s.generation
     };
 
@@ -543,6 +577,10 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
         }
     };
 
+    // Keep the preview box the same shape as the video, so it fills it edge to edge.
+    let mode = &session.plan.mode;
+    ui.set_preview_aspect(mode.width as f32 / mode.height.max(1) as f32);
+
     if record_on {
         let mut warn = session.plan.warnings.clone();
         warn.insert(
@@ -552,7 +590,6 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
         show(ui, &warn.join(" "), false);
     }
     ui.set_recording(record_on);
-    ui.set_busy(false);
     ui.set_lost_text("0".into());
     ui.set_lost_warning(false);
     ui.set_size_text("–".into());
@@ -562,23 +599,36 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
 
     state.borrow_mut().running = Some(Running {
         stop: session.stop_handle(),
+        controls: session.controls.clone(),
         recording: record_on,
         generation,
     });
 
     let weak = ui.as_weak();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let stats_weak = weak.clone();
         let watched = session.watch(None, Duration::from_secs(1), |st| {
             let st = st.clone();
             let _ = stats_weak.upgrade_in_event_loop(move |ui| show_stats(&ui, &st, record_on));
         });
-        if record_on {
-            let _ = weak.upgrade_in_event_loop(|ui| ui.set_busy(true));
+
+        // Let go of the card first, so the preview can come straight back while the
+        // file is finished (mixed, converted) in the background.
+        session.release();
+        let error = watched.err();
+        {
+            let error = error.clone();
+            let _ =
+                weak.upgrade_in_event_loop(move |ui| released(&ui, generation, record_on, error));
         }
-        let finished = session.finish(&opts);
-        let _ = weak.upgrade_in_event_loop(move |ui| ended(&ui, generation, watched, finished));
+        if session.is_recording() {
+            let finished = session.finish(&opts);
+            let _ = weak.upgrade_in_event_loop(move |ui| finished_recording(&ui, finished));
+        }
     });
+    let mut s = state.borrow_mut();
+    s.workers.retain(|w| !w.is_finished());
+    s.workers.push(worker);
 }
 
 fn show_stats(ui: &AppWindow, st: &record::Stats, recording: bool) {
@@ -604,89 +654,150 @@ fn show_stats(ui: &AppWindow, st: &record::Stats, recording: bool) {
     }
 }
 
-/// A session ended. Report how it went, then start whatever is pending.
-fn ended(
-    ui: &AppWindow,
-    generation: u64,
-    watched: Result<(), String>,
-    finished: Option<record::Finished>,
-) {
-    let state = STATE.with(|s| s.borrow().clone());
-    let Some(state) = state else { return };
+/// A session has stopped and let go of the card. Start whatever comes next right away:
+/// the preview after Stop, or (after a signal drop mid-recording) a new recording.
+fn released(ui: &AppWindow, generation: u64, was_recording: bool, error: Option<String>) {
+    let Some(state) = STATE.with(|s| s.borrow().clone()) else {
+        return;
+    };
     let was_current = state
         .borrow()
         .running
         .as_ref()
         .is_some_and(|r| r.generation == generation);
-    if was_current {
-        state.borrow_mut().running = None;
+    if !was_current {
+        return;
     }
+    state.borrow_mut().running = None;
     ui.set_recording(false);
-    ui.set_busy(false);
 
-    match (&watched, &finished) {
-        (Err(e), _) => show(ui, e, true),
-        (Ok(()), Some(f)) => {
-            let path = match ask_where_to_save(ui, &f.path) {
-                Some(dest) => {
-                    move_recording(ui, f.path.clone(), dest.clone());
-                    dest
-                }
-                None => f.path.clone(),
-            };
-            let mut text = format!(
-                "Saved {} ({}). ",
-                path.display(),
-                estimate::human_bytes(f.size as f64)
+    let mut next = state.borrow_mut().pending.take();
+    if let Some(e) = &error {
+        if was_recording && next.is_none() && may_auto_continue(&state) {
+            // The signal dropped mid-recording (e.g. the console switched HDMI modes
+            // when a game started). Keep going in a new file rather than stopping.
+            show(
+                ui,
+                &format!(
+                    "The capture dropped out ({e}). The recording so far is saved, and recording continues in a new file."
+                ),
+                true,
             );
-            text.push_str(&if f.lost == 0 {
-                "No frames lost.".to_string()
-            } else {
-                format!("{} frame(s) were lost.", f.lost)
-            });
-            if let Some(e) = &f.finish_error {
-                text.push_str(&format!(
-                    " Finishing failed ({e}); the MKV with separate tracks is safe."
-                ));
-            }
-            if f.lost > 0 || f.finish_error.is_some() {
-                show(ui, &text, true);
-            } else {
-                show_success(ui, &text);
-            }
+            next = Some(true);
+        } else {
+            show(ui, e, true);
         }
-        (Ok(()), None) => {}
     }
-
-    let next = state.borrow_mut().pending.take();
-    if let Some(record_on) = next {
-        start_now(ui, &state, record_on);
-    } else if watched.is_err() {
-        ui.set_has_preview(false);
-        ui.set_preview_message("Preview stopped. Change a setting to try again.".into());
+    if was_recording {
+        // The file is still being finished in the background.
+        state.borrow_mut().finishing += 1;
+        ui.set_busy(true);
+    }
+    match next {
+        Some(record_on) => start_now(ui, &state, record_on),
+        None if error.is_none() || was_recording => start_now(ui, &state, false),
+        None => {
+            ui.set_has_preview(false);
+            ui.set_preview_message("Preview stopped. Change a setting to try again.".into());
+        }
     }
 }
 
-/// Ask where to save a finished recording, pre-filled with its folder and name.
-/// Returns the new path, or None to leave it where it is (also when the dialog is
-/// turned off, or no file dialog is available, e.g. in Game Mode).
-fn ask_where_to_save(ui: &AppWindow, current: &std::path::Path) -> Option<PathBuf> {
-    if !ui.get_ask_save() {
-        return None;
+/// Allow at most 3 automatic restarts per minute, so a card that keeps failing
+/// doesn't loop forever.
+fn may_auto_continue(state: &Rc<RefCell<State>>) -> bool {
+    let mut s = state.borrow_mut();
+    let now = std::time::Instant::now();
+    s.auto_restarts
+        .retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+    if s.auto_restarts.len() >= 3 {
+        return false;
     }
-    let ext = current.extension()?.to_str()?.to_string();
-    let mut dest = rfd::FileDialog::new()
-        .set_title("Save recording")
-        .set_directory(current.parent()?)
-        .set_file_name(current.file_name()?.to_string_lossy())
-        .add_filter(ext.to_uppercase(), &[ext.as_str()])
-        .save_file()?;
-    // The file is what it is: keep its real extension even if the name was changed.
-    if dest.extension().and_then(|e| e.to_str()) != Some(ext.as_str()) {
-        let name = format!("{}.{ext}", dest.file_name()?.to_string_lossy());
-        dest.set_file_name(name);
+    s.auto_restarts.push(now);
+    true
+}
+
+/// A recording's file is finished (mixed, converted). Report it, then offer Save As.
+fn finished_recording(ui: &AppWindow, finished: Option<record::Finished>) {
+    let Some(state) = STATE.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    {
+        let mut s = state.borrow_mut();
+        s.finishing = s.finishing.saturating_sub(1);
+        ui.set_busy(s.finishing > 0);
     }
-    (dest != current).then_some(dest)
+    let Some(f) = finished else { return };
+    let mut text = format!(
+        "Saved {} ({}). ",
+        f.path.display(),
+        estimate::human_bytes(f.size as f64)
+    );
+    text.push_str(&if f.lost == 0 {
+        "No frames lost.".to_string()
+    } else {
+        format!("{} frame(s) were lost.", f.lost)
+    });
+    if let Some(e) = &f.finish_error {
+        text.push_str(&format!(
+            " Finishing failed ({e}); the MKV with separate tracks is safe."
+        ));
+    }
+    if f.lost > 0 || f.finish_error.is_some() {
+        show(ui, &text, true);
+    } else {
+        show_success(ui, &text);
+    }
+    if ui.get_ask_save() {
+        ask_where_to_save(ui, f.path);
+    }
+}
+
+/// Ask where to save a finished recording, pre-filled with its folder and name. The
+/// dialog runs on its own thread so the window and preview keep running while it's
+/// open. Cancel (or no file dialog available, e.g. in Game Mode) leaves it in place.
+fn ask_where_to_save(ui: &AppWindow, current: PathBuf) {
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(ext) = current
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let (Some(dir), Some(name)) = (current.parent(), current.file_name()) else {
+            return;
+        };
+        let Some(mut dest) = rfd::FileDialog::new()
+            .set_title("Save recording")
+            .set_directory(dir)
+            .set_file_name(name.to_string_lossy())
+            .add_filter(ext.to_uppercase(), &[ext.as_str()])
+            .save_file()
+        else {
+            return;
+        };
+        // The file is what it is: keep its real extension even if the name changed.
+        if dest.extension().and_then(|e| e.to_str()) != Some(ext.as_str()) {
+            let name = format!(
+                "{}.{ext}",
+                dest.file_name().unwrap_or_default().to_string_lossy()
+            );
+            dest.set_file_name(name);
+        }
+        if dest == current {
+            return;
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            show(
+                &ui,
+                &format!("Moving the recording to {}…", dest.display()),
+                false,
+            );
+            move_recording(&ui, current, dest);
+        });
+    });
 }
 
 /// Move a recording in the background: instant on the same drive, a copy when it goes

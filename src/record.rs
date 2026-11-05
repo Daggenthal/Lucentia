@@ -62,6 +62,44 @@ pub struct Options {
     pub record: bool,
     /// Send preview frames here (the app window) instead of opening a preview window.
     pub frames: Option<preview::FrameSink>,
+    /// Start with the game audio muted on the speakers (recording is unaffected).
+    pub listen_muted: bool,
+    /// Start with the mic muted in the recording.
+    pub mic_muted: bool,
+}
+
+/// Live controls for a running session: change volume and mute without restarting.
+#[derive(Clone, Default)]
+pub struct Controls {
+    game_volume: Option<gst::Element>,
+    mic_volume: Option<gst::Element>,
+    listen: Option<gst::Element>,
+}
+
+impl Controls {
+    /// Game volume in percent, for both the recording and what you hear.
+    pub fn set_game_volume(&self, pct: f64) {
+        if let Some(v) = &self.game_volume {
+            v.set_property("volume", pct / 100.0);
+        }
+    }
+    pub fn set_mic_volume(&self, pct: f64) {
+        if let Some(v) = &self.mic_volume {
+            v.set_property("volume", pct / 100.0);
+        }
+    }
+    /// Mute what plays on the speakers. The recording keeps the game audio.
+    pub fn set_listen_muted(&self, muted: bool) {
+        if let Some(v) = &self.listen {
+            v.set_property("mute", muted);
+        }
+    }
+    /// Mute the mic in the recording.
+    pub fn set_mic_muted(&self, muted: bool) {
+        if let Some(v) = &self.mic_volume {
+            v.set_property("mute", muted);
+        }
+    }
 }
 
 /// Default bitrate: 40 Mbit/s at 1080p60, scaled by pixels per second, within 10 to 200.
@@ -220,6 +258,7 @@ impl StopHandle {
 pub struct Session {
     pipeline: gst::Pipeline,
     stats: Arc<FrameStats>,
+    pub controls: Controls,
     stopping: Arc<AtomicBool>,
     recording: bool,
     pub plan: Plan,
@@ -298,7 +337,12 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
         return Err("nothing to do: not recording and no preview".into());
     }
 
+    // Audio waits for the first good video frame: anything earlier is dropped, so the
+    // file doesn't open with a frozen or blank picture while the card starts up.
+    let first_video = Arc::new(AtomicU64::new(u64::MAX));
+
     // Audio.
+    let mut controls = Controls::default();
     if plan.game_audio {
         let src = match card {
             Some(c) => match devices::find_audio_for(c) {
@@ -314,7 +358,7 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
             None => Some(test_tone(440.0)?),
         };
         if let Some(src) = src {
-            add_audio_track(
+            let t = add_audio_track(
                 &pipeline,
                 src,
                 mux.as_ref(),
@@ -322,8 +366,14 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
                 0,
                 opts.game_volume,
                 showing,
+                &first_video,
                 opts,
             )?;
+            if let Some(l) = &t.listen {
+                l.set_property("mute", opts.listen_muted);
+            }
+            controls.game_volume = Some(t.volume);
+            controls.listen = t.listen;
         }
     }
 
@@ -337,7 +387,7 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
             log::debug(&format!("mic {}", dev.display_name()));
             preview::audio_source(&dev)?
         };
-        add_audio_track(
+        let t = add_audio_track(
             &pipeline,
             src,
             Some(mux),
@@ -345,20 +395,57 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
             opts.mic_offset_ms,
             opts.mic_volume,
             false,
+            &first_video,
             opts,
         )?;
+        t.volume.set_property("mute", opts.mic_muted);
+        controls.mic_volume = Some(t.volume);
     }
 
-    // Watch frames for gaps (lost frames).
+    // Drop damaged frames before anything sees them. The card's driver flags frames
+    // it couldn't receive completely (common for the first frame after the capture
+    // starts, and while the HDMI signal changes); shown, they're the green flashes.
+    // The first two frames are dropped too, as the card is still settling.
+    {
+        let seen = AtomicU64::new(0);
+        probe_point
+            .static_pad("src")
+            .ok_or("capsfilter has no src pad")?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let n = seen.fetch_add(1, Ordering::Relaxed);
+                let damaged = info
+                    .buffer()
+                    .is_some_and(|b| b.flags().contains(gst::BufferFlags::CORRUPTED));
+                if n < 2 || damaged {
+                    if damaged {
+                        log::debug("dropped a damaged frame from the card");
+                    }
+                    gst::PadProbeReturn::Drop
+                } else {
+                    gst::PadProbeReturn::Ok
+                }
+            });
+    }
+
+    // Watch frames for gaps (lost frames), and note when the first good one arrives.
     let stats = Arc::new(FrameStats::new(mode.fps()));
     {
         let stats = stats.clone();
+        let first_video = first_video.clone();
         probe_point
             .static_pad("src")
             .ok_or("capsfilter has no src pad")?
             .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
                 if let Some(buf) = info.buffer() {
                     stats.frame(buf.pts());
+                    if let Some(pts) = buf.pts() {
+                        let _ = first_video.compare_exchange(
+                            u64::MAX,
+                            pts.nseconds(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
                 }
                 gst::PadProbeReturn::Ok
             });
@@ -371,6 +458,7 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
     Ok(Session {
         pipeline,
         stats,
+        controls,
         stopping: Arc::new(AtomicBool::new(false)),
         recording: mux.is_some(),
         plan,
@@ -470,8 +558,18 @@ impl Session {
     }
 
     /// Close everything down and, when recording, finish the file (mix, MP4).
-    pub fn finish(self, opts: &Options) -> Option<Finished> {
+    /// Stop capturing and let go of the card, so a new session can open it right
+    /// away. Finishing the file (mix, MP4) can then happen in the background.
+    pub fn release(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording
+    }
+
+    pub fn finish(self, opts: &Options) -> Option<Finished> {
+        self.release();
         if !self.recording {
             return None;
         }
@@ -608,6 +706,13 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
 
 /// Audio source -> 48 kHz stereo -> [volume] -> tee -> [encoder -> mux] and/or
 /// [speakers]. A nonzero offset shifts the whole track.
+/// The elements of an audio track that can be changed while running.
+struct AudioTrack {
+    volume: gst::Element,
+    /// The speakers branch, when this track is being played.
+    listen: Option<gst::Element>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_audio_track(
     pipeline: &gst::Pipeline,
@@ -617,8 +722,9 @@ fn add_audio_track(
     offset_ms: i64,
     volume_pct: f64,
     listen: bool,
+    first_video: &Arc<AtomicU64>,
     opts: &Options,
-) -> Result<(), String> {
+) -> Result<AudioTrack, String> {
     let caps = make("capsfilter")?;
     caps.set_property(
         "caps",
@@ -634,15 +740,32 @@ fn add_audio_track(
         make("audioresample")?,
         caps,
     ];
-    if (volume_pct - 100.0).abs() > 0.01 {
-        let vol = make("volume")?;
-        vol.set_property("volume", volume_pct / 100.0);
-        chain.push(vol);
-    }
+    // Always present, so volume and mute can change live.
+    let vol = make("volume")?;
+    vol.set_property("volume", volume_pct / 100.0);
+    chain.push(vol.clone());
     let last = chain.last().unwrap().clone();
     let tee = make("tee")?;
     chain.push(tee.clone());
     add_chain(pipeline, &chain, title)?;
+    {
+        // Drop audio from before the first good video frame (see `start`).
+        let first_video = first_video.clone();
+        last.static_pad("src")
+            .ok_or("audio chain has no src pad")?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let start = first_video.load(Ordering::Acquire);
+                let early = info
+                    .buffer()
+                    .and_then(|b| b.pts())
+                    .is_none_or(|pts| start == u64::MAX || pts.nseconds() < start);
+                if early {
+                    gst::PadProbeReturn::Drop
+                } else {
+                    gst::PadProbeReturn::Ok
+                }
+            });
+    }
     if offset_ms != 0 {
         // Shift this track's timestamps: positive delays it, negative moves it earlier.
         // Lines the mic up with video that reaches us a little late through the card.
@@ -659,17 +782,29 @@ fn add_audio_track(
         link_to_mux(enc.last().unwrap(), mux, title)?;
     }
 
+    let mut speakers = None;
     if listen {
-        // Play this track on the speakers while the preview is showing.
+        // Play this track on the speakers while the preview is showing. Its own volume
+        // element mutes the speakers without touching the recording.
         let q = make("queue")?;
         q.set_property_from_str("leaky", "downstream");
-        let listen = [q, make("audioconvert")?, make("autoaudiosink")?];
-        add_chain(pipeline, &listen, "preview audio")?;
-        tee.link(&listen[0])
+        let mute = make("volume")?;
+        let chain = [
+            q,
+            mute.clone(),
+            make("audioconvert")?,
+            make("autoaudiosink")?,
+        ];
+        add_chain(pipeline, &chain, "preview audio")?;
+        tee.link(&chain[0])
             .map_err(|_| "could not connect the preview audio")?;
+        speakers = Some(mute);
     }
 
-    Ok(())
+    Ok(AudioTrack {
+        volume: vol,
+        listen: speakers,
+    })
 }
 
 /// Request a pad on the muxer, link to it, and give the track a name players show.
@@ -993,6 +1128,8 @@ mod tests {
             preview: false,
             test_source: true,
             record: false,
+            listen_muted: false,
+            mic_muted: false,
             frames: Some(Arc::new(move |f: preview::Frame| {
                 let max = f.rgba.iter().step_by(4).copied().max().unwrap_or(0);
                 assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);

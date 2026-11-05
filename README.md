@@ -21,7 +21,7 @@ Tested on: SteamOS with an Elgato 4K X.
 ## Planned
 
 - Mic level meters and live monitoring
-- Use Lucentia as a source in OBS for streaming
+- Use Lucentia as a source in OBS, or as a camera in Discord, to stream just the gameplay
 - AppImage for any Linux distro, with Windows and macOS builds later
 
 ## Building

@@ -19,6 +19,27 @@ component Hint inherits Text {
     wrap: word-wrap;
 }
 
+// A small square button with an icon, e.g. mute.
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> active: false;
+    in property <string> tip;
+    callback clicked();
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    background: root.active ? #d0303040 : (touch.has-hover ? Palette.foreground.transparentize(0.88) : transparent);
+    Image {
+        width: 20px;
+        height: 20px;
+        source: root.icon;
+        colorize: root.active ? #e04548 : Palette.foreground;
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
 component Stat inherits VerticalLayout {
     in property <string> label;
     in property <string> value;
@@ -39,6 +60,8 @@ export component AppWindow inherits Window {
     // Preview
     in property <image> preview;
     in property <bool> has-preview: false;
+    // Width / height of the video, so the preview box keeps its shape.
+    in property <float> preview-aspect: 16 / 9;
     in property <string> preview-message: "Starting preview…";
 
     // Source
@@ -71,6 +94,9 @@ export component AppWindow inherits Window {
     in-out property <float> mic-volume: 100;
     in-out property <int> mic-offset: 0;
     in-out property <bool> mix-track: true;
+    // Mute what plays on the speakers (not the recording), and mute the mic.
+    in-out property <bool> listen-muted: false;
+    in-out property <bool> mic-muted: false;
 
     // Output
     in property <[string]> formats: ["MKV (recommended)", "MP4"];
@@ -106,6 +132,8 @@ export component AppWindow inherits Window {
     callback device-changed();
     callback mode-changed();
     callback settings-changed();
+    callback game-audio-toggled();
+    callback audio-levels-changed();
     callback record-clicked();
     callback choose-folder();
     callback open-folder();
@@ -119,15 +147,22 @@ export component AppWindow inherits Window {
 
             Rectangle {
                 vertical-stretch: 1;
-                background: #000000;
-                border-radius: 8px;
-                clip: true;
+                // The video box: as big as fits while keeping the video's shape, so
+                // the picture always fills it and there are no bars on resize.
+                video-box := Rectangle {
+                    width: min(parent.width, parent.height * root.preview-aspect);
+                    height: self.width / root.preview-aspect;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: #000000;
+                    border-radius: 8px;
+                    clip: true;
 
                 if root.has-preview: Image {
                     width: parent.width;
                     height: parent.height;
                     source: root.preview;
-                    image-fit: contain;
+                    image-fit: fill;
                 }
                 if !root.has-preview: Text {
                     text: root.preview-message;
@@ -164,6 +199,7 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
+                }
                 }
             }
 
@@ -232,14 +268,16 @@ export component AppWindow inherits Window {
                                     selected => { root.device-changed(); }
                                 }
                                 Row {
+                                    Label { text: "Resolution"; width: 90px; }
                                     ComboBox {
-                                        horizontal-stretch: 2;
                                         model: root.resolutions;
                                         current-index <=> root.resolution-index;
                                         selected => { root.mode-changed(); }
                                     }
+                                }
+                                Row {
+                                    Label { text: "Frame rate"; width: 90px; }
                                     ComboBox {
-                                        horizontal-stretch: 1;
                                         model: root.rates;
                                         current-index <=> root.rate-index;
                                         selected => { root.mode-changed(); }
@@ -321,18 +359,38 @@ export component AppWindow inherits Window {
                             enabled: !root.recording && !root.busy;
                             VerticalLayout {
                                 spacing: 8px;
-                                CheckBox {
-                                    text: "Game audio";
-                                    checked <=> root.game-audio;
-                                    toggled => { root.settings-changed(); }
+                                Row {
+                                    CheckBox {
+                                        text: "Game audio";
+                                        checked <=> root.game-audio;
+                                        toggled => { root.game-audio-toggled(); }
+                                    }
+                                    IconButton {
+                                        icon: root.listen-muted ? @image-url("icons/speaker-off.svg") : @image-url("icons/speaker.svg");
+                                        active: root.listen-muted;
+                                        clicked => {
+                                            root.listen-muted = !root.listen-muted;
+                                            root.audio-levels-changed();
+                                        }
+                                    }
+                                }
+                                Hint {
+                                    text: root.listen-muted ? "Speakers muted. The recording still has the game audio." : "";
+                                    visible: root.listen-muted;
+                                    height: root.listen-muted ? self.preferred-height : 0;
                                 }
                                 Row {
                                     Label { text: "Game " + round(root.game-volume) + "%"; width: 90px; }
                                     Slider {
                                         minimum: 0;
                                         maximum: 200;
+                                        step: 5;
                                         value <=> root.game-volume;
-                                        released => { root.settings-changed(); }
+                                        changed(v) => {
+                                            // Snap to 5% steps.
+                                            root.game-volume = round(v / 5) * 5;
+                                            root.audio-levels-changed();
+                                        }
                                     }
                                 }
                                 Row {
@@ -342,14 +400,26 @@ export component AppWindow inherits Window {
                                         current-index <=> root.mic-index;
                                         selected => { root.settings-changed(); }
                                     }
+                                    if root.mic-index > 0: IconButton {
+                                        icon: root.mic-muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
+                                        active: root.mic-muted;
+                                        clicked => {
+                                            root.mic-muted = !root.mic-muted;
+                                            root.audio-levels-changed();
+                                        }
+                                    }
                                 }
                                 if root.mic-index > 0: Row {
                                     Label { text: "Mic " + round(root.mic-volume) + "%"; width: 90px; }
                                     Slider {
                                         minimum: 0;
                                         maximum: 200;
+                                        step: 5;
                                         value <=> root.mic-volume;
-                                        released => { root.settings-changed(); }
+                                        changed(v) => {
+                                            root.mic-volume = round(v / 5) * 5;
+                                            root.audio-levels-changed();
+                                        }
                                     }
                                 }
                                 if root.mic-index > 0: Row {
@@ -357,6 +427,7 @@ export component AppWindow inherits Window {
                                     SpinBox {
                                         minimum: -500;
                                         maximum: 500;
+                                        step-size: 5;
                                         value <=> root.mic-offset;
                                         edited => { root.settings-changed(); }
                                     }
