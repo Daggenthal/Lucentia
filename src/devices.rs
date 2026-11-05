@@ -13,9 +13,33 @@ use crate::log;
 /// Elgato's USB vendor ID. The Wave XLR shares it, so we also require video.
 const ELGATO_VENDOR: &str = "0fd9";
 
-/// Known Elgato models by USB product ID. Anything else from Elgato still works,
-/// it just shows the name the system reports.
-const KNOWN_MODELS: &[(&str, &str)] = &[("009b", "Elgato 4K X")];
+/// Known Elgato capture cards by USB product ID. Anything else from Elgato still
+/// works, it just shows the name the system reports. Only the 4K X is tested.
+///
+/// The 4K X and 4K S change their product ID with the USB link speed, so a card
+/// on a slower port shows up under a different ID (and offers fewer modes).
+const KNOWN_MODELS: &[(&str, &str)] = &[
+    ("009b", "Elgato 4K X"), // 10 Gbps
+    ("009c", "Elgato 4K X"), // 5 Gbps
+    ("009d", "Elgato 4K X"), // USB 2.0
+    ("00af", "Elgato 4K S"), // USB 3
+    ("00ae", "Elgato 4K S"), // USB 2.0
+    ("0082", "Elgato HD60 X"),
+    ("0066", "Elgato Cam Link 4K"),
+];
+
+/// A note to show when a card is running in a reduced mode, based on its product ID.
+pub fn link_speed_note(product_id: &str) -> Option<&'static str> {
+    match product_id {
+        "009c" => Some(
+            "running at 5 Gbps: the fastest modes need a 10 Gbps USB-C port (USB 3.2 Gen 2)",
+        ),
+        "009d" | "00ae" => Some(
+            "running at USB 2.0 speed: plug it into a USB 3 port for full resolution and frame rate",
+        ),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -57,6 +81,8 @@ pub struct CaptureDevice {
     pub serial: Option<String>,
     pub is_elgato: bool,
     pub modes: Vec<Mode>,
+    /// The GStreamer device, used to create a source element on non-Linux systems.
+    pub device: gst::Device,
 }
 
 /// List every video capture device currently connected.
@@ -126,6 +152,7 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
             serial,
             is_elgato,
             modes,
+            device: dev.clone(),
         };
 
         // The same card can show up once per device provider (V4L2 and PipeWire).
@@ -152,6 +179,49 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
     // Elgato cards first, then everything else.
     out.sort_by_key(|d| !d.is_elgato);
     Ok(out)
+}
+
+/// Find the audio input that belongs to a capture card.
+///
+/// Capture cards show up as a separate USB audio device. Its name in PipeWire or
+/// PulseAudio contains the card's serial number (on SteamOS it's a loopback source
+/// like alsa_loopback_device.alsa_input.usb-Elgato_Elgato_4K_X_<serial>-02...), so we
+/// match on that, falling back to the card's name.
+pub fn find_audio_for(card: &CaptureDevice) -> Option<gst::Device> {
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Audio/Source"), None);
+    if monitor.start().is_err() {
+        log::warn("could not start the audio device monitor");
+        return None;
+    }
+    let devices = monitor.devices();
+    monitor.stop();
+
+    let describe = |d: &gst::Device| {
+        let props = d.properties().map(|p| p.to_string()).unwrap_or_default();
+        format!("{} {}", d.display_name(), props)
+    };
+
+    let mut by_serial = None;
+    let mut by_name = None;
+    for d in devices.iter() {
+        let text = describe(d);
+        // Speaker "monitor" sources record what's playing, not an input.
+        if text.contains(".monitor") || d.device_class().contains("Monitor") {
+            continue;
+        }
+        log::debug(&format!("audio candidate: {}", d.display_name()));
+        if let Some(serial) = &card.serial {
+            if by_serial.is_none() && text.contains(serial.as_str()) {
+                by_serial = Some(d.clone());
+            }
+        }
+        let short_name = card.name.trim_start_matches("Elgato ").trim();
+        if by_name.is_none() && d.display_name().contains(short_name) {
+            by_name = Some(d.clone());
+        }
+    }
+    by_serial.or(by_name)
 }
 
 /// "0x0FD9" and "0fd9" both become "0fd9".
