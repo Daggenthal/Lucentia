@@ -11,7 +11,7 @@ Early days. Right now Lucentia can:
 - Tone map HDR in the preview so it doesn't look washed out
 - Record with H.264, HEVC, AV1 or raw video, at any bitrate, with CBR, VBR or constant quality
 - Record 10-bit HDR with correct HDR10 tags
-- Record your mic on its own track, with a sync offset and an optional mixed track
+- Record your mic: a Game + Mic track that players play by default, plus separate Game and Mic tracks for editing, with a sync offset
 - Estimate file size before you start, and show size, bitrate, lost frames and time left on the drive while recording
 
 Tested on: SteamOS with an Elgato 4K X.
@@ -51,7 +51,7 @@ cargo run --release -- --help                          # all options
 cargo run --release -- record                                   # 1080p60, HEVC, 40 Mbit/s, game audio
 cargo run --release -- record --mode 2560x1440@60 --hdr         # 10-bit HDR (AV1 by default)
 cargo run --release -- record --codec av1 --quality 20          # constant quality instead of a bitrate
-cargo run --release -- record --mic Wave --mix-track            # mic on its own track, plus a mixed track
+cargo run --release -- record --mic Wave                        # adds Game + Mic, then separate Game and Mic tracks
 cargo run --release -- record --analysis --cbr 150              # every frame a keyframe, for frame analysis
 cargo run --release -- record --preview --duration 600          # watch while recording, stop after 10 minutes
 cargo run --release -- mics                                     # list microphones for --mic

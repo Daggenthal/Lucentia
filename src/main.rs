@@ -47,7 +47,9 @@ Record options:
   --audio-bitrate K  Audio bitrate in kbit/s (default 320)
   --mic NAME       Also record a mic as its own track (part of its name, or default)
   --mic-offset MS  Shift the mic in milliseconds to line it up with the video
-  --mix-track      Add a third track with game and mic mixed together
+  --no-mix-track   With --mic, leave out the \"Game + Mic\" track. By default it's the
+                   first audio track (what players play), followed by separate Game
+                   and Mic tracks for editing
   --format F       mkv (default) or mp4. MKV is recommended: if the app, the system
                    or the power cuts out mid-recording, everything up to that moment
                    is still playable, and players show the track names (Game, Mic).
@@ -55,7 +57,7 @@ Record options:
                    stop, for editors or sites that only take MP4.
   --output PATH    Where to save (default ~/Videos/Lucentia/Lucentia <date>.mkv)
   --duration SECS  Stop by itself after this long
-  --preview        Show a preview window while recording
+  --preview        Show a preview window (with game audio) while recording
 
 Global options:
   --debug, -d      Full logging
@@ -249,7 +251,7 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
         audio_kbps: 320,
         mic: None,
         mic_offset_ms: 0,
-        mix_track: false,
+        mix_track: true,
         container: record::Container::Mkv,
         output: None,
         duration: None,
@@ -331,6 +333,7 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
                     parse_num(next_value(&mut it, "--mic-offset", "40"), "--mic-offset")
             }
             "--mix-track" => opts.mix_track = true,
+            "--no-mix-track" => opts.mix_track = false,
             "--format" => {
                 opts.container = match next_value(&mut it, "--format", "mkv")
                     .to_ascii_lowercase()
@@ -357,9 +360,6 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
     }
     if opts.capture.hdr && opts.capture.mjpeg {
         fail("--hdr and --mjpeg can't be combined: the card's MJPEG modes are 8-bit");
-    }
-    if opts.mix_track && opts.mic.is_none() {
-        log::warn("--mix-track needs --mic; recording without a mix track");
     }
     let card = if opts.test_source {
         None

@@ -192,7 +192,6 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
 
     // Audio.
     let mut mixer: Option<gst::Element> = None;
-    let mut mix_out: Option<gst::Element> = None;
     if opts.mix_track && opts.mic.is_some() {
         let m = make("audiomixer")?;
         pipeline.add(&m).map_err(|e| e.to_string())?;
@@ -201,8 +200,9 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
         add_chain(&pipeline, &mix_chain[1..], "mix track")?;
         m.link(&mix_chain[1])
             .map_err(|_| "could not connect the mixer")?;
-        // Linked to the muxer after the game and mic tracks, so it's the last track.
-        mix_out = mix_chain.last().cloned();
+        // Linked to the muxer first, so it's the first audio track: the one players
+        // play by default, with game and mic together. The separate tracks follow.
+        link_to_mux(mix_chain.last().unwrap(), &mux, "Game + Mic")?;
         mixer = Some(m);
     }
 
@@ -248,9 +248,6 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
             opts,
             mixer.as_ref(),
         )?;
-    }
-    if let Some(out) = &mix_out {
-        link_to_mux(out, &mux, "Game + Mic")?;
     }
 
     // ---- Watch frames for gaps (lost frames) ----------------------------------------
@@ -393,6 +390,16 @@ fn add_audio_track(
     tee.link(&enc[0])
         .map_err(|_| format!("could not connect the {title} track"))?;
     link_to_mux(enc.last().unwrap(), mux, title)?;
+
+    if opts.preview && title == "Game" {
+        // Play the game audio while the preview window is open.
+        let q = make("queue")?;
+        q.set_property_from_str("leaky", "downstream");
+        let listen = [q, make("audioconvert")?, make("autoaudiosink")?];
+        add_chain(pipeline, &listen, "preview audio")?;
+        tee.link(&listen[0])
+            .map_err(|_| "could not connect the preview audio")?;
+    }
 
     if let Some(m) = mixer {
         let q = make("queue")?;
@@ -690,14 +697,14 @@ fn print_plan(
         "none".to_string()
     } else {
         let mut t = Vec::new();
+        if opts.mic.is_some() && opts.mix_track {
+            t.push("Game + Mic");
+        }
         if opts.capture.audio {
             t.push("Game");
         }
         if opts.mic.is_some() {
             t.push("Mic");
-            if opts.mix_track {
-                t.push("Game + Mic");
-            }
         }
         let codec = match opts.audio_codec {
             AudioCodec::Aac => format!("AAC {} kbit/s", opts.audio_kbps),
