@@ -267,6 +267,18 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             }
         });
     }
+    // Closing the main window quits, even with the pop-out window still open.
+    ui.window().on_close_requested(|| {
+        let _ = slint::quit_event_loop();
+        slint::CloseRequestResponse::HideWindow
+    });
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_popout_clicked(move || {
+            let ui = w.unwrap();
+            toggle_popout(&ui, &s);
+        });
+    }
     {
         let (w, s) = (ui.as_weak(), state.clone());
         // The echo canceller is part of the mic's path, so the preview restarts.
@@ -526,6 +538,60 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     }
 }
 
+/// Open or close the pop-out video window. While it's open, frames are sent at up
+/// to 1080p so a Discord share isn't blurry; back to 720p when it closes.
+fn toggle_popout(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let open = POPOUT.with(|p| p.borrow().is_some());
+    if open {
+        close_popout(ui, state);
+        return;
+    }
+    let win = match VideoWindow::new() {
+        Ok(w) => w,
+        Err(e) => {
+            show(ui, &format!("could not open the video window: {e}"), true);
+            return;
+        }
+    };
+    {
+        let w = win.as_weak();
+        win.on_toggle_fullscreen(move || {
+            if let Some(w) = w.upgrade() {
+                let full = w.window().is_fullscreen();
+                w.window().set_fullscreen(!full);
+            }
+        });
+    }
+    {
+        let (u, s) = (ui.as_weak(), state.clone());
+        win.window().on_close_requested(move || {
+            if let Some(ui) = u.upgrade() {
+                close_popout(&ui, &s);
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+    if let Err(e) = win.show() {
+        show(ui, &format!("could not open the video window: {e}"), true);
+        return;
+    }
+    POPOUT.with(|p| *p.borrow_mut() = Some(win));
+    ui.set_popout_open(true);
+    if let Some(r) = &state.borrow().running {
+        r.session.set_preview_width(1920);
+    }
+}
+
+fn close_popout(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    if let Some(w) = POPOUT.with(|p| p.borrow_mut().take()) {
+        let _ = w.hide();
+    }
+    ui.set_popout_open(false);
+    if let Some(r) = &state.borrow().running {
+        r.session.set_preview_width(1280);
+    }
+}
+
 /// Fill the virtual camera menu: Off, the PipeWire camera, and any v4l2loopback
 /// devices found.
 fn fill_cameras(ui: &AppWindow, state: &Rc<RefCell<State>>) {
@@ -558,11 +624,20 @@ fn apply_camera(ui: &AppWindow, s: &State) {
                  cameras: OBS (Video Capture Device (PipeWire)) and browsers."
                 .to_string();
             if !has_loopback {
-                n.push_str(
-                    " Discord's app only sees regular cameras: for it, load v4l2loopback \
-                     (sudo modprobe v4l2loopback video_nr=10 card_label=Lucentia \
-                     exclusive_caps=1) and restart Lucentia.",
-                );
+                if record::loopback_module_available() {
+                    n.push_str(
+                        " Discord's app only sees regular cameras: for it, run this \
+                         command, then restart Lucentia.",
+                    );
+                } else {
+                    n.push_str(
+                        " Discord's app only sees regular cameras, which needs the \
+                         v4l2loopback kernel module, and it isn't installed for this kernel. \
+                         On Arch: sudo pacman -S v4l2loopback-dkms linux-headers. On \
+                         SteamOS it isn't included; use OBS with this camera, or share the \
+                         Lucentia window in Discord.",
+                    );
+                }
             }
             n
         }
@@ -573,6 +648,13 @@ fn apply_camera(ui: &AppWindow, s: &State) {
         ),
     };
     ui.set_virtual_camera_note(note.into());
+    // The exact command, with a Copy button, so nobody has to type it.
+    let show_command = matches!(target, Some(record::VirtualCamera::PipeWire))
+        && !has_loopback
+        && record::loopback_module_available();
+    ui.set_loopback_command(
+        if show_command { record::LOOPBACK_COMMAND } else { "" }.into(),
+    );
     if let Some(r) = &s.running {
         if let Err(e) = r.session.set_virtual_camera(target) {
             show(ui, &e, true);
@@ -784,7 +866,15 @@ fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         buf.make_mut_bytes().copy_from_slice(&f.rgba);
         let flag = in_flight.clone();
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            ui.set_preview(slint::Image::from_rgba8(buf));
+            let image = slint::Image::from_rgba8(buf);
+            // The pop-out window shows the same frame (no extra copy).
+            POPOUT.with(|p| {
+                if let Some(w) = &*p.borrow() {
+                    w.set_frame(image.clone());
+                    w.set_has_frame(true);
+                }
+            });
+            ui.set_preview(image);
             ui.set_has_preview(true);
             flag.store(false, Ordering::Release);
         });
@@ -823,6 +913,9 @@ fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         generation,
     });
     apply_camera(ui, &state.borrow());
+    if POPOUT.with(|p| p.borrow().is_some()) {
+        session.set_preview_width(1920);
+    }
 
     let weak = ui.as_weak();
     let worker = std::thread::spawn(move || {
@@ -973,7 +1066,115 @@ fn finish_with_progress(
     })
 }
 
+/// Settings > Debug: what's happening, and what to do about lost frames.
+fn show_diagnostics(ui: &AppWindow, st: &record::Stats) {
+    let Some(state) = STATE.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    let s = state.borrow();
+    let Some(running) = &s.running else { return };
+    let plan = &running.session.plan;
+    let mode = &plan.mode;
+    let device = card(ui, &s);
+    let link = device
+        .and_then(|d| d.product_id.as_deref())
+        .and_then(devices::link_speed_note);
+
+    let mut lines = vec![
+        format!(
+            "Capture: {} at {}x{}@{} {}",
+            device.map(|d| d.name.as_str()).unwrap_or("test pattern"),
+            mode.width,
+            mode.height,
+            preview::fmt_fps(mode.fps()),
+            if mode.kind == Kind::Mjpeg { "MJPEG" } else { mode.format.as_str() }
+        ),
+        format!("USB: {}", link.unwrap_or("full speed")),
+        format!(
+            "GPU: {}",
+            crate::check::gpu_name().unwrap_or_else(|| "unknown".into())
+        ),
+    ];
+    if let Some(enc) = &st.encoder {
+        let kind = if enc.starts_with("va") { "GPU" } else { "CPU" };
+        lines.push(format!(
+            "Encoder: {enc} ({kind}), {:.1} s waiting",
+            st.encoder_backlog
+        ));
+    }
+    lines.push(format!(
+        "Frames: {} lost in {} gap(s), longest {:.0} ms; {} damaged frame(s) dropped",
+        st.lost_total, st.gaps, st.worst_gap_ms, st.damaged
+    ));
+    lines.push(format!(
+        "Preview: {:.1} fps of {}; CPU: {:.0}%",
+        st.fps,
+        preview::fmt_fps(mode.fps()),
+        st.cpu_pct
+    ));
+
+    let mut advice = Vec::new();
+    if st.damaged > 0 {
+        advice.push(
+            "Damaged frames: the card got a broken HDMI signal. A few when a game starts or \
+             changes modes are normal; a steady stream means try another HDMI cable."
+                .to_string(),
+        );
+    }
+    if st.gaps > 0 && st.worst_gap_ms > 300.0 {
+        advice.push(format!(
+            "The HDMI signal dropped out for up to {:.0} ms. That happens when the source \
+             switches resolution, refresh rate or HDR (often when a game starts). Set the \
+             console or PC to a fixed output mode to avoid it.",
+            st.worst_gap_ms
+        ));
+    } else if st.gaps > 0 {
+        advice.push(match link {
+            Some(l) => format!("Frames arrived late over USB: the card is {l}."),
+            None => "Frames arrived late over USB. Plug the card straight into a 10 Gbps \
+                     USB-C port, not a hub or dock, and close other heavy USB devices."
+                .to_string(),
+        });
+    }
+    if st.encoder_backlog > 1.0 {
+        let enc = st.encoder.clone().unwrap_or_default();
+        advice.push(if enc.starts_with("va") {
+            format!(
+                "The GPU encoder is falling behind ({:.1} s of video waiting). Lower the \
+                 bitrate, resolution or frame rate.",
+                st.encoder_backlog
+            )
+        } else {
+            format!(
+                "The CPU encoder ({enc}) can't keep up ({:.1} s of video waiting). Pick a \
+                 codec your GPU encodes, or lower the resolution or frame rate.",
+                st.encoder_backlog
+            )
+        });
+    }
+    if st.cpu_pct > 85.0 {
+        advice.push(format!(
+            "Lucentia is using {:.0}% of the CPU. Closing other apps or using the GPU encoder \
+             will help.",
+            st.cpu_pct
+        ));
+    }
+    if st.lost_total == 0 && st.fps > 0.0 && st.fps < mode.fps() * 0.85 {
+        advice.push(
+            "The preview shows fewer frames than the capture. That's only the window; \
+             recordings get every frame."
+                .to_string(),
+        );
+    }
+    if advice.is_empty() {
+        advice.push("No problems found.".to_string());
+    }
+    ui.set_diagnostics(lines.join("\n").into());
+    ui.set_advice(advice.join("\n\n").into());
+}
+
 fn show_stats(ui: &AppWindow, st: &record::Stats) {
+    show_diagnostics(ui, st);
     ui.set_fps_text(format!("{:.2}", st.fps).into());
     ui.set_lost_text(st.lost.to_string().into());
     ui.set_lost_warning(st.lost > 0);
@@ -1171,6 +1372,8 @@ fn move_recording(ui: &AppWindow, from: PathBuf, to: PathBuf) {
 thread_local! {
     /// The window's state, reachable from callbacks that only get the window handle.
     static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
+    /// The pop-out video window, when open.
+    static POPOUT: RefCell<Option<VideoWindow>> = const { RefCell::new(None) };
 }
 
 // ---- Settings file -------------------------------------------------------------------

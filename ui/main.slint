@@ -80,14 +80,16 @@ component RecordButton inherits Rectangle {
     in property <bool> recording: false;
     callback clicked();
     height: 44px;
+    // Same padding as the Share button: just the label plus some room.
+    width: label.preferred-width + 34px;
     border-radius: 8px;
     background: root.busy ? #6b7280
         : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
         : (touch.has-hover ? #e04548 : #d23a3d);
-    Text {
+    label := Text {
         text: root.text;
         color: #ffffff;
-        font-size: 16px;
+        font-size: 15px;
         font-weight: 700;
     }
     touch := TouchArea {
@@ -161,6 +163,10 @@ export component AppWindow inherits Window {
     // Audio levels for the meters, 0 to 1.
     in property <float> game-level: 0;
     in property <float> mic-level: 0;
+    // Settings > Debug.
+    in property <string> diagnostics: "Starts with the preview.";
+    in property <string> advice;
+    in-out property <bool> diagnostics-copied: false;
     in property <string> hotkey-text: "Setting up the record hotkey…";
     callback echo-cancel-toggled();
     // Record button text while a recording is being finished.
@@ -209,10 +215,15 @@ export component AppWindow inherits Window {
     in property <[string]> virtual-cameras: ["Off"];
     in-out property <int> virtual-camera-index: 0;
     in property <string> virtual-camera-note;
+    // The v4l2loopback command to copy, when it's needed.
+    in property <string> loopback-command;
+    in-out property <bool> command-copied: false;
     callback virtual-camera-changed();
     // The settings panel was shown or hidden (to remember it).
     callback settings-toggled();
     in-out property <bool> settings-open: false;
+    in property <bool> popout-open: false;
+    callback popout-clicked();
 
     function toggle-settings() {
         root.settings-open = !root.settings-open;
@@ -358,9 +369,41 @@ export component AppWindow inherits Window {
                     Stat { label: "BITRATE"; value: root.recording ? root.bitrate-text : "–"; }
                     Stat { label: "DISK SPACE LEFT"; value: root.drive-text; }
                     Rectangle { horizontal-stretch: 1; }
+                    // Opens a window with only the video, to share in Discord
+                    // ("Share a Window") or put on another screen.
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        height: 44px;
+                        width: pop-row.preferred-width;
+                        border-radius: 8px;
+                        background: root.popout-open
+                            ? Palette.foreground.transparentize(pop-touch.has-hover ? 0.74 : 0.8)
+                            : Palette.foreground.transparentize(pop-touch.has-hover ? 0.85 : 0.92);
+                        pop-row := HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 16px;
+                            spacing: 8px;
+                            Image {
+                                width: 18px;
+                                height: 18px;
+                                y: (parent.height - self.height) / 2;
+                                source: @image-url("icons/popout.svg");
+                                colorize: Palette.foreground;
+                            }
+                            Text {
+                                text: root.popout-open ? "Sharing" : "Share";
+                                color: Palette.foreground;
+                                font-size: 15px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        pop-touch := TouchArea {
+                            clicked => { root.popout-clicked(); }
+                        }
+                    }
                     RecordButton {
                         y: (parent.height - self.height) / 2;
-                        width: 160px;
                         busy: root.busy;
                         recording: root.recording;
                         text: root.busy ? root.finish-text : root.recording ? "Stop recording" : "Record";
@@ -623,7 +666,7 @@ export component AppWindow inherits Window {
                         }
 
                         GroupBox {
-                            title: "Share (OBS, Discord)";
+                            title: "Virtual camera (OBS, Discord)";
                             VerticalLayout {
                                 spacing: 8px;
                                 Row {
@@ -635,6 +678,36 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Hint { text: root.virtual-camera-note; }
+                                if root.loopback-command != "": HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 32px;
+                                        border-radius: 6px;
+                                        background: Palette.foreground.transparentize(0.92);
+                                        clip: true;
+                                        command := TextInput {
+                                            x: 8px;
+                                            width: parent.width - 16px;
+                                            text: root.loopback-command;
+                                            read-only: true;
+                                            single-line: true;
+                                            font-family: "monospace";
+                                            font-size: 11px;
+                                            color: Palette.foreground;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Button {
+                                        text: root.command-copied ? "Copied" : "Copy";
+                                        clicked => {
+                                            command.select-all();
+                                            command.copy();
+                                            command.clear-selection();
+                                            root.command-copied = true;
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -699,6 +772,43 @@ export component AppWindow inherits Window {
                         }
 
                         GroupBox {
+                            title: "Debug";
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: root.diagnostics;
+                                    color: Palette.foreground.transparentize(0.2);
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                                Text {
+                                    text: root.advice;
+                                    color: root.advice == "No problems found." ? #3fb950 : #d09000;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                                // Holds the text to copy; the clipboard goes through it.
+                                Rectangle {
+                                    height: 0px;
+                                    clip: true;
+                                    diag-copy := TextInput {
+                                        text: "Lucentia " + root.version + "\n" + root.diagnostics + "\n\n" + root.advice;
+                                        read-only: true;
+                                    }
+                                }
+                                Button {
+                                    text: root.diagnostics-copied ? "Copied" : "Copy diagnostics";
+                                    clicked => {
+                                        diag-copy.select-all();
+                                        diag-copy.copy();
+                                        diag-copy.clear-selection();
+                                        root.diagnostics-copied = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        GroupBox {
                             title: "About";
                             VerticalLayout {
                                 spacing: 8px;
@@ -713,4 +823,33 @@ export component AppWindow inherits Window {
 
             }
         }
+}
+
+// A window with nothing but the video, for sharing in Discord ("Share a Window") or
+// putting on a second screen. Double-click for full screen.
+export component VideoWindow inherits Window {
+    title: "Lucentia Video";
+    preferred-width: 1280px;
+    preferred-height: 720px;
+    min-width: 320px;
+    min-height: 180px;
+    background: #000000;
+    in property <image> frame;
+    in property <bool> has-frame: false;
+    callback toggle-fullscreen();
+
+    if root.has-frame: Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.frame;
+        image-fit: contain;
+    }
+    if !root.has-frame: Text {
+        text: "Waiting for video…";
+        color: #8a93a3;
+        font-size: 14px;
+    }
+    TouchArea {
+        double-clicked => { root.toggle-fullscreen(); }
+    }
 }

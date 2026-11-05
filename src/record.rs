@@ -255,6 +255,17 @@ pub struct Stats {
     /// Seconds of recording left on the drive at the current rate.
     pub drive_left: Option<f64>,
     pub recording: bool,
+    /// Diagnostics (Settings > Debug), counted since the session started.
+    pub damaged: u64,
+    pub gaps: u64,
+    pub worst_gap_ms: f64,
+    pub lost_total: u64,
+    /// Seconds of video waiting for the encoder (0 when it keeps up).
+    pub encoder_backlog: f64,
+    /// The video encoder in use while recording, e.g. "vah265enc".
+    pub encoder: Option<String>,
+    /// Lucentia's CPU use, as a share of the whole CPU (0 to 100).
+    pub cpu_pct: f64,
 }
 
 /// The result of a finished recording.
@@ -295,6 +306,9 @@ struct ActiveRecording {
     plan: Plan,
     started: Instant,
     lost_at_start: u64,
+    /// The queue in front of the encoder: how far behind the encoder is.
+    video_queue: gst::Element,
+    encoder: String,
 }
 
 /// A recording that has been detached, waiting to be finished.
@@ -453,8 +467,10 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
     // it couldn't receive completely (the first frame after the capture starts, and
     // whenever the HDMI signal changes); shown, they're the green flashes. The first
     // two frames are dropped too, as the card is still settling.
+    let stats = Arc::new(FrameStats::new(mode.fps()));
     {
         let seen = AtomicU64::new(0);
+        let stats = stats.clone();
         probe_point
             .static_pad("src")
             .ok_or("capsfilter has no src pad")?
@@ -465,6 +481,7 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
                     .is_some_and(|b| b.flags().contains(gst::BufferFlags::CORRUPTED));
                 if n < 2 || damaged {
                     if damaged {
+                        stats.damaged.fetch_add(1, Ordering::Relaxed);
                         log::debug("dropped a damaged frame from the card");
                     }
                     gst::PadProbeReturn::Drop
@@ -475,7 +492,6 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
     }
 
     // Watch frames for gaps (lost frames).
-    let stats = Arc::new(FrameStats::new(mode.fps()));
     {
         let stats = stats.clone();
         probe_point
@@ -512,6 +528,21 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
             AtomicU32::new(SILENT_DB.to_bits()),
             AtomicU32::new(SILENT_DB.to_bits()),
         ]),
+    })
+}
+
+/// Loads v4l2loopback the way Chromium-based apps (Discord) need it.
+pub const LOOPBACK_COMMAND: &str =
+    "sudo modprobe v4l2loopback video_nr=10 card_label=Lucentia exclusive_caps=1";
+
+/// Whether the v4l2loopback module exists for the running kernel.
+pub fn loopback_module_available() -> bool {
+    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        return false;
+    };
+    let dir = std::path::Path::new("/lib/modules").join(release.trim());
+    ["modules.dep", "modules.builtin"].iter().any(|f| {
+        std::fs::read_to_string(dir.join(f)).is_ok_and(|t| t.contains("v4l2loopback"))
     })
 }
 
@@ -594,6 +625,12 @@ impl Session {
             video.push(rate);
         }
         video.extend(encode::video_chain(&plan.video)?);
+        let video_queue = video[0].clone();
+        let encoder = video
+            .iter()
+            .filter_map(|e| e.factory().map(|f| f.name().to_string()))
+            .find(|n| n.ends_with("enc"))
+            .unwrap_or_else(|| "raw (no encoder)".into());
         add_to_bin(&bin, &video, "video encoder")?;
         link_to_mux(video.last().unwrap(), &mux, "Video")?;
         inputs.push((self.video_tee.clone(), video[0].clone(), "video"));
@@ -695,6 +732,8 @@ impl Session {
             plan,
             started: Instant::now(),
             lost_at_start: self.stats.lost.load(Ordering::Relaxed),
+            video_queue,
+            encoder,
         });
         Ok(())
     }
@@ -869,6 +908,27 @@ impl Session {
         Ok(())
     }
 
+    /// Change the size of the frames sent to the window (bigger for the pop-out
+    /// video window), without restarting anything.
+    pub fn set_preview_width(&self, max_width: i32) {
+        let (w, h) = preview::preview_size_max(&self.plan.mode, max_width);
+        for (name, gl) in [("preview-gl-size", true), ("preview-size", false)] {
+            if let Some(f) = self.pipeline.by_name(name) {
+                let b = gst::Caps::builder("video/x-raw")
+                    .field("format", "RGBA")
+                    .field("width", w as i32)
+                    .field("height", h as i32);
+                let caps = if gl {
+                    b.features(["memory:GLMemory"]).build()
+                } else {
+                    b.build()
+                };
+                f.set_property("caps", caps);
+            }
+        }
+        log::debug(&format!("preview frames now {w}x{h}"));
+    }
+
     /// Latest peak levels in dB: (game, mic).
     pub fn levels(&self) -> (f32, f32) {
         (
@@ -912,6 +972,10 @@ impl Session {
     ) -> Result<(), String> {
         let bus = self.pipeline.bus().ok_or("pipeline has no bus")?;
         let mut last = (Instant::now(), 0u64);
+        let mut cpu_prev = cpu_seconds();
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as f64)
+            .unwrap_or(1.0);
         loop {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
                 use gst::MessageView;
@@ -972,7 +1036,17 @@ impl Session {
                 let frames = self.stats.frames.load(Ordering::Relaxed);
                 let fps = (frames - last.1) as f64 / last.0.elapsed().as_secs_f64();
                 let lost_total = self.stats.lost.load(Ordering::Relaxed);
-                let st = match &*self.recording.lock().unwrap() {
+                let (cpu_now, cpu_pct) = {
+                    let now = cpu_seconds();
+                    let wall = last.0.elapsed().as_secs_f64().max(0.001);
+                    let pct = match (now, cpu_prev) {
+                        (Some(n), Some(p)) => (n - p) / wall / cpus * 100.0,
+                        _ => 0.0,
+                    };
+                    (now, pct)
+                };
+                cpu_prev = cpu_now;
+                let mut st = match &*self.recording.lock().unwrap() {
                     Some(rec) => {
                         let elapsed = rec.started.elapsed().as_secs_f64();
                         let size = std::fs::metadata(&rec.plan.mkv_path)
@@ -991,6 +1065,13 @@ impl Session {
                             lost: lost_total.saturating_sub(rec.lost_at_start),
                             drive_left,
                             recording: true,
+                            encoder_backlog: rec
+                                .video_queue
+                                .property::<u64>("current-level-time")
+                                as f64
+                                / 1e9,
+                            encoder: Some(rec.encoder.clone()),
+                            ..Default::default()
                         }
                     }
                     None => Stats {
@@ -1000,11 +1081,29 @@ impl Session {
                         ..Default::default()
                     },
                 };
+                st.damaged = self.stats.damaged.load(Ordering::Relaxed);
+                st.gaps = self.stats.gaps.load(Ordering::Relaxed);
+                st.worst_gap_ms = self.stats.worst_gap_ns.load(Ordering::Relaxed) as f64 / 1e6;
+                st.lost_total = lost_total;
+                st.cpu_pct = cpu_pct;
                 report(&st);
                 last = (Instant::now(), frames);
             }
         }
     }
+}
+
+/// CPU time this process has used so far, in seconds (Linux).
+fn cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields after the command name, which is in parentheses and may contain spaces.
+    let rest = stat.rsplit_once(')')?.1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let utime: f64 = f.get(11)?.parse().ok()?;
+    let stime: f64 = f.get(12)?.parse().ok()?;
+    // SAFETY: sysconf with a valid name has no preconditions.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    Some((utime + stime) / ticks.max(1.0))
 }
 
 /// Lower this thread's CPU and disk priority, so background work (finishing a file)
@@ -1503,6 +1602,11 @@ fn test_tone(freq: f64) -> Result<gst::Element, String> {
 struct FrameStats {
     frames: AtomicU64,
     lost: AtomicU64,
+    /// Frames the card flagged as damaged (dropped before anything sees them).
+    damaged: AtomicU64,
+    /// Times frames went missing, and the longest gap in nanoseconds.
+    gaps: AtomicU64,
+    worst_gap_ns: AtomicU64,
     last_pts: Mutex<Option<gst::ClockTime>>,
     frame_ns: f64,
 }
@@ -1512,6 +1616,9 @@ impl FrameStats {
         FrameStats {
             frames: AtomicU64::new(0),
             lost: AtomicU64::new(0),
+            damaged: AtomicU64::new(0),
+            gaps: AtomicU64::new(0),
+            worst_gap_ns: AtomicU64::new(0),
             last_pts: Mutex::new(None),
             frame_ns: 1e9 / fps.max(1.0),
         }
@@ -1527,6 +1634,8 @@ impl FrameStats {
             if gap > self.frame_ns * 1.5 {
                 let missing = (gap / self.frame_ns).round() as u64 - 1;
                 self.lost.fetch_add(missing, Ordering::Relaxed);
+                self.gaps.fetch_add(1, Ordering::Relaxed);
+                self.worst_gap_ns.fetch_max(gap as u64, Ordering::Relaxed);
                 log::debug(&format!(
                     "gap of {:.1} ms: {missing} frame(s) lost",
                     gap / 1e6

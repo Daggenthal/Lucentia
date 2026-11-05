@@ -325,6 +325,7 @@ pub(crate) fn frames_chain(
             }
             chain.push(scale);
             let gl_caps = make("capsfilter")?;
+            gl_caps.set_property("name", "preview-gl-size");
             gl_caps.set_property("caps", rgba(true));
             chain.push(gl_caps);
             chain.push(down);
@@ -336,6 +337,7 @@ pub(crate) fn frames_chain(
         }
     }
     let caps = make("capsfilter")?;
+    caps.set_property("name", "preview-size");
     caps.set_property("caps", rgba(false));
     chain.push(caps);
 
@@ -383,7 +385,12 @@ fn sample_to_frame(sample: &gst::Sample) -> Option<Frame> {
 /// Preview size for a mode: 1280 wide (or the mode's own width if smaller), keeping
 /// the aspect ratio, rounded to even numbers.
 pub fn preview_size(mode: &Mode) -> (u32, u32) {
-    let w = mode.width.min(1280).max(2) as u32;
+    preview_size_max(mode, 1280)
+}
+
+/// Preview frame size for a mode, at most `max_width` wide, keeping the shape.
+pub fn preview_size_max(mode: &Mode, max_width: i32) -> (u32, u32) {
+    let w = mode.width.min(max_width).max(2) as u32;
     let h = ((w as f64 * mode.height as f64 / mode.width.max(1) as f64).round() as u32).max(2);
     (w & !1, h & !1)
 }
