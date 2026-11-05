@@ -58,6 +58,10 @@ pub struct Options {
     pub preview: bool,
     /// Record a test pattern and tones instead of a real card (for development).
     pub test_source: bool,
+    /// Write a file. Off = preview only (the app window before Record is pressed).
+    pub record: bool,
+    /// Send preview frames here (the app window) instead of opening a preview window.
+    pub frames: Option<preview::FrameSink>,
 }
 
 /// Default bitrate: 40 Mbit/s at 1080p60, scaled by pixels per second, within 10 to 200.
@@ -66,8 +70,22 @@ pub fn default_kbps(mode: &Mode) -> u32 {
     (40_000.0 * ratio).clamp(10_000.0, 200_000.0).round() as u32
 }
 
-pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
-    // ---- Work out the settings ------------------------------------------------------
+/// Everything decided before a session starts: the mode, encoder settings, where the
+/// file goes and how big it will get. Warnings are collected for the caller to show.
+pub struct Plan {
+    pub mode: Mode,
+    pub hdr: bool,
+    pub video: VideoSettings,
+    pub container: Container,
+    pub final_path: PathBuf,
+    pub mkv_path: PathBuf,
+    pub est: estimate::Rate,
+    pub game_audio: bool,
+    pub audio_tracks: u32,
+    pub warnings: Vec<String>,
+}
+
+pub fn plan(card: Option<&CaptureDevice>, opts: &Options) -> Result<Plan, String> {
     let mode = match card {
         Some(c) => preview::choose_mode(c, &opts.capture)?,
         None => test_mode(&opts.capture),
@@ -77,7 +95,7 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
         .codec
         .unwrap_or(if hdr { Codec::Av1 } else { Codec::Hevc });
     if hdr && codec == Codec::H264 {
-        return Err("H.264 can't record HDR. Use --codec hevc or --codec av1.".into());
+        return Err("H.264 can't record HDR. Use HEVC or AV1.".into());
     }
     if codec == Codec::Raw && mode.kind == Kind::Mjpeg {
         return Err(
@@ -85,19 +103,24 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
                 .into(),
         );
     }
-    if codec == Codec::Hevc && mode.ten_bit() {
-        log::warn(
+    let mut warnings = Vec::new();
+    if opts.record && codec == Codec::Hevc && mode.ten_bit() {
+        warnings.push(
             "10-bit HEVC files get labeled \"Main\" instead of \"Main 10\" by the GPU encoder \
-             (a known GStreamer issue). They play fine in most players; use --codec av1 if a \
-             tool rejects them.",
+             (a known GStreamer issue). They play fine in most players; use AV1 if a tool \
+             rejects them."
+                .to_string(),
         );
     }
-    if mode.kind == Kind::Mjpeg {
-        log::warn("MJPEG modes are compressed by the card before we re-encode them, so expect some quality loss");
+    if opts.record && mode.kind == Kind::Mjpeg {
+        warnings.push(
+            "MJPEG modes are compressed by the card before we re-encode them, so expect some quality loss"
+                .to_string(),
+        );
     }
     let mut container = opts.container;
     if opts.audio_codec == AudioCodec::Pcm && container == Container::Mp4 {
-        log::warn("PCM audio doesn't fit in MP4, keeping the recording as MKV");
+        warnings.push("PCM audio doesn't fit in MP4, keeping the recording as MKV".to_string());
         container = Container::Mkv;
     }
 
@@ -119,16 +142,12 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
     let game_audio = opts.capture.audio;
     let audio_tracks = game_audio as u32
         + opts.mic.is_some() as u32
-        + (opts.mix_track && opts.mic.is_some()) as u32;
+        + (opts.mix_track && opts.mic.is_some() && game_audio) as u32;
 
     let final_path = opts.output.clone().unwrap_or_else(default_output);
     let final_path = with_extension(&final_path, container);
     let mkv_path = with_extension(&final_path, Container::Mkv);
-    if let Some(dir) = final_path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
-    }
 
-    // ---- Tell the user what's about to happen ---------------------------------------
     let est = estimate::rate(&estimate::Inputs {
         codec,
         rate,
@@ -140,32 +159,103 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
         audio_kbps: opts.audio_kbps,
         audio_tracks,
     });
-    print_plan(
-        card,
-        &mode,
+    Ok(Plan {
+        mode,
         hdr,
-        &video,
-        opts,
-        audio_tracks,
+        video,
         container,
-        &final_path,
+        final_path,
+        mkv_path,
         est,
-    );
-    check_disk(&final_path, est, codec);
+        game_audio,
+        audio_tracks,
+        warnings,
+    })
+}
 
-    // ---- Build the pipeline ---------------------------------------------------------
-    let pipeline = gst::Pipeline::new();
-    let mux = make("matroskamux")?;
-    if mux.find_property("writing-app").is_some() {
-        mux.set_property("writing-app", "Lucentia");
+/// Live numbers for a running session.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub elapsed: f64,
+    /// Bytes written so far (0 when previewing).
+    pub size: u64,
+    pub mbps: f64,
+    pub fps: f64,
+    pub lost: u64,
+    /// Seconds of recording left on the drive at the current rate.
+    pub drive_left: Option<f64>,
+}
+
+/// The result of a finished recording.
+pub struct Finished {
+    pub path: PathBuf,
+    pub size: u64,
+    pub lost: u64,
+    /// Set when the mix or MP4 step failed and the MKV was kept instead.
+    pub finish_error: Option<String>,
+}
+
+/// Stops a session from another thread (Ctrl+C, the app's Stop button).
+#[derive(Clone)]
+pub struct StopHandle {
+    pipeline: gst::glib::WeakRef<gst::Pipeline>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl StopHandle {
+    /// Finish cleanly: end the stream so every file gets closed properly.
+    /// Returns false if a stop was already in progress.
+    pub fn stop(&self) -> bool {
+        if self.stopping.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(p) = self.pipeline.upgrade() {
+            p.send_event(gst::event::Eos::new());
+        }
+        true
     }
-    let sink = make("filesink")?;
-    sink.set_property("location", mkv_path.to_string_lossy().to_string());
-    pipeline
-        .add_many([&mux, &sink])
-        .map_err(|e| e.to_string())?;
-    mux.link(&sink)
-        .map_err(|_| "could not connect the muxer to the file")?;
+}
+
+/// A running preview or recording.
+pub struct Session {
+    pipeline: gst::Pipeline,
+    stats: Arc<FrameStats>,
+    stopping: Arc<AtomicBool>,
+    recording: bool,
+    pub plan: Plan,
+}
+
+pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result<Session, String> {
+    let mode = plan.mode.clone();
+    let hdr = plan.hdr;
+    if opts.record {
+        if let Some(dir) = plan
+            .final_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+        }
+    }
+
+    let pipeline = gst::Pipeline::new();
+    let mux = if opts.record {
+        let mux = make("matroskamux")?;
+        if mux.find_property("writing-app").is_some() {
+            mux.set_property("writing-app", "Lucentia");
+        }
+        let sink = make("filesink")?;
+        sink.set_property("location", plan.mkv_path.to_string_lossy().to_string());
+        pipeline
+            .add_many([&mux, &sink])
+            .map_err(|e| e.to_string())?;
+        mux.link(&sink)
+            .map_err(|_| "could not connect the muxer to the file")?;
+        Some(mux)
+    } else {
+        None
+    };
 
     // Video.
     let (mut cap_chain, probe_point) = match card {
@@ -176,73 +266,90 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
     cap_chain.push(vtee.clone());
     add_chain(&pipeline, &cap_chain, "video capture")?;
 
-    // A big queue before the encoder so frames wait in memory while it starts up,
-    // instead of being dropped (the 50 lost frames in our first manual test).
-    let mut enc_chain = vec![unbounded_queue()?];
-    enc_chain.extend(encode::video_chain(&video)?);
-    add_chain(&pipeline, &enc_chain, "video encoder")?;
-    vtee.link(&enc_chain[0])
-        .map_err(|_| "could not connect the video to the encoder")?;
-    link_to_mux(enc_chain.last().unwrap(), &mux, "Video")?;
+    if let Some(mux) = &mux {
+        // A big queue before the encoder so frames wait in memory while it starts up,
+        // instead of being dropped (the 50 lost frames in our first manual test).
+        let mut enc_chain = vec![unbounded_queue()?];
+        enc_chain.extend(encode::video_chain(&plan.video)?);
+        add_chain(&pipeline, &enc_chain, "video encoder")?;
+        vtee.link(&enc_chain[0])
+            .map_err(|_| "could not connect the video to the encoder")?;
+        link_to_mux(enc_chain.last().unwrap(), mux, "Video")?;
+    }
 
-    if opts.preview {
+    let showing = opts.frames.is_some() || opts.preview;
+    if showing {
         let q = make("queue")?;
         q.set_property_from_str("leaky", "downstream");
         q.set_property("max-size-buffers", 2u32);
         let mut disp = vec![q];
-        disp.extend(preview::display_chain(hdr)?);
+        match &opts.frames {
+            Some(sink) => {
+                let (w, h) = preview::preview_size(&mode);
+                disp.extend(preview::frames_chain(hdr, w, h, sink.clone())?);
+            }
+            None => disp.extend(preview::display_chain(hdr)?),
+        }
         add_chain(&pipeline, &disp, "preview")?;
         vtee.link(&disp[0])
             .map_err(|_| "could not connect the preview")?;
     }
+    if mux.is_none() && !showing {
+        return Err("nothing to do: not recording and no preview".into());
+    }
 
     // Audio.
-
-    if game_audio {
+    if plan.game_audio {
         let src = match card {
             Some(c) => match devices::find_audio_for(c) {
                 Some(dev) => {
-                    println!(
-                        "{} game audio from {}",
-                        log::green("found"),
-                        dev.display_name()
-                    );
+                    log::debug(&format!("game audio from {}", dev.display_name()));
                     Some(preview::audio_source(&dev)?)
                 }
                 None => {
-                    log::warn("couldn't find this card's audio, recording without game audio");
+                    log::warn("couldn't find this card's audio, continuing without game audio");
                     None
                 }
             },
             None => Some(test_tone(440.0)?),
         };
         if let Some(src) = src {
-            add_audio_track(&pipeline, src, &mux, "Game", 0, opts.game_volume, opts)?;
+            add_audio_track(
+                &pipeline,
+                src,
+                mux.as_ref(),
+                "Game",
+                0,
+                opts.game_volume,
+                showing,
+                opts,
+            )?;
         }
     }
 
-    if let Some(name) = &opts.mic {
+    if let (Some(name), Some(mux)) = (&opts.mic, &mux) {
         let src = if opts.test_source {
             test_tone(880.0)?
         } else {
             let dev = devices::find_mic(name).ok_or_else(|| {
                 format!("no microphone matches `{name}`. Run `lucentia mics` to list them.")
             })?;
-            println!("{} mic {}", log::green("found"), dev.display_name());
+            log::debug(&format!("mic {}", dev.display_name()));
             preview::audio_source(&dev)?
         };
         add_audio_track(
             &pipeline,
             src,
-            &mux,
+            Some(mux),
             "Mic",
             opts.mic_offset_ms,
             opts.mic_volume,
+            false,
             opts,
         )?;
     }
 
-    // ---- Watch frames for gaps (lost frames) ----------------------------------------
+    // Watch frames for gaps (lost frames).
     let stats = Arc::new(FrameStats::new(mode.fps()));
     {
         let stats = stats.clone();
@@ -257,104 +364,259 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
             });
     }
 
-    // ---- Run ------------------------------------------------------------------------
-    let stopping = Arc::new(AtomicBool::new(false));
-    {
-        let weak = pipeline.downgrade();
-        let stopping = stopping.clone();
-        let _ = ctrlc::set_handler(move || {
-            if stopping.swap(true, Ordering::SeqCst) {
-                // Second Ctrl+C: give up on finishing the file cleanly.
-                eprintln!(
-                    "{}",
-                    log::red("stopping immediately; the MKV is still playable")
-                );
-                std::process::exit(130);
-            }
-            println!(
-                "\n{} finishing the file (press Ctrl+C again to force quit)",
-                log::yellow("stopping:")
-            );
-            if let Some(p) = weak.upgrade() {
-                p.send_event(gst::event::Eos::new());
-            }
-        });
+    pipeline.set_state(gst::State::Playing).map_err(|_| {
+        "the capture failed to start. Is another program using the card? Run with --debug for details."
+            .to_string()
+    })?;
+    Ok(Session {
+        pipeline,
+        stats,
+        stopping: Arc::new(AtomicBool::new(false)),
+        recording: mux.is_some(),
+        plan,
+    })
+}
+
+impl Session {
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            pipeline: self.pipeline.downgrade(),
+            stopping: self.stopping.clone(),
+        }
     }
 
-    pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|_| "recording failed to start. Run with --debug for details.".to_string())?;
+    /// Run until the session ends (stopped, --duration reached, or an error),
+    /// calling `report` with fresh stats every `every`.
+    pub fn watch(
+        &self,
+        duration: Option<f64>,
+        every: Duration,
+        mut report: impl FnMut(&Stats),
+    ) -> Result<(), String> {
+        let bus = self.pipeline.bus().ok_or("pipeline has no bus")?;
+        let start = Instant::now();
+        let mut last = (Instant::now(), 0u64);
+        loop {
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+                use gst::MessageView;
+                match msg.view() {
+                    MessageView::Eos(_) => return Ok(()),
+                    MessageView::Error(e) => {
+                        let text = e.error().to_string();
+                        if text.contains("window was closed") {
+                            // Closing the preview window stops cleanly.
+                            if self.stop_handle().stop() {
+                                println!(
+                                    "{}",
+                                    log::yellow("preview closed, finishing the recording")
+                                );
+                            }
+                            continue;
+                        }
+                        let debug = e.debug().map(|d| d.to_string()).unwrap_or_default();
+                        log::debug(&format!(
+                            "from {:?}: {debug}",
+                            e.src().map(|s| s.path_string())
+                        ));
+                        return Err(if self.recording {
+                            format!("{text} (the MKV recorded so far is still playable)")
+                        } else {
+                            text
+                        });
+                    }
+                    MessageView::Warning(w) => log::warn(&w.error().to_string()),
+                    _ => {}
+                }
+            }
+
+            if let Some(d) = duration {
+                if start.elapsed().as_secs_f64() >= d && self.stop_handle().stop() {
+                    println!(
+                        "{} reached --duration, finishing the file",
+                        log::dim("stopping:")
+                    );
+                }
+            }
+
+            if last.0.elapsed() >= every && !self.stopping.load(Ordering::Relaxed) {
+                let frames = self.stats.frames.load(Ordering::Relaxed);
+                let fps = (frames - last.1) as f64 / last.0.elapsed().as_secs_f64();
+                let elapsed = start.elapsed().as_secs_f64();
+                let (size, drive_left) = if self.recording {
+                    let size = std::fs::metadata(&self.plan.mkv_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let per_sec = size as f64 / elapsed.max(1.0);
+                    // Only estimate once data is actually reaching the file (encoders can
+                    // take a moment to start writing).
+                    let left = estimate::free_space(&self.plan.mkv_path)
+                        .filter(|_| size > 0 && per_sec > 1000.0)
+                        .map(|free| free as f64 / per_sec);
+                    (size, left)
+                } else {
+                    (0, None)
+                };
+                report(&Stats {
+                    elapsed,
+                    size,
+                    mbps: size as f64 * 8.0 / 1e6 / elapsed.max(1.0),
+                    fps,
+                    lost: self.stats.lost.load(Ordering::Relaxed),
+                    drive_left,
+                });
+                last = (Instant::now(), frames);
+            }
+        }
+    }
+
+    /// Close everything down and, when recording, finish the file (mix, MP4).
+    pub fn finish(self, opts: &Options) -> Option<Finished> {
+        let _ = self.pipeline.set_state(gst::State::Null);
+        if !self.recording {
+            return None;
+        }
+        let plan = &self.plan;
+        let size = std::fs::metadata(&plan.mkv_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let lost = self.stats.lost.load(Ordering::Relaxed);
+        let add_mix = opts.mix_track && opts.mic.is_some() && plan.game_audio;
+        if plan.container == Container::Mp4 || add_mix {
+            let mix = add_mix.then_some((opts.audio_codec, opts.audio_kbps));
+            match remux::finalize(
+                &plan.mkv_path,
+                &plan.final_path,
+                plan.container == Container::Mp4,
+                mix,
+            ) {
+                Ok(()) => {
+                    return Some(Finished {
+                        size: std::fs::metadata(&plan.final_path)
+                            .map(|m| m.len())
+                            .unwrap_or(0),
+                        path: plan.final_path.clone(),
+                        lost,
+                        finish_error: None,
+                    })
+                }
+                Err(e) => {
+                    return Some(Finished {
+                        path: plan.mkv_path.clone(),
+                        size,
+                        lost,
+                        finish_error: Some(e),
+                    })
+                }
+            }
+        }
+        Some(Finished {
+            path: plan.mkv_path.clone(),
+            size,
+            lost,
+            finish_error: None,
+        })
+    }
+}
+
+/// The `lucentia record` command: plan, print, record until Ctrl+C or --duration,
+/// then finish the file.
+pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
+    let plan = plan(card, opts)?;
+    for w in &plan.warnings {
+        log::warn(w);
+    }
+    print_plan(card, &plan, opts);
+    check_disk(&plan.final_path, plan.est, plan.video.codec);
+
+    let session = start(card, opts, plan)?;
+    let stop = session.stop_handle();
+    let _ = ctrlc::set_handler(move || {
+        if !stop.stop() {
+            // Second Ctrl+C: give up on finishing the file cleanly.
+            eprintln!(
+                "{}",
+                log::red("stopping immediately; the MKV is still playable")
+            );
+            std::process::exit(130);
+        }
+        println!(
+            "\n{} finishing the file (press Ctrl+C again to force quit)",
+            log::yellow("stopping:")
+        );
+    });
     println!(
         "{} {}  (Ctrl+C to stop)",
         log::green("recording"),
-        mkv_path.display()
+        session.plan.mkv_path.display()
     );
 
-    let result = watch(&pipeline, &stats, &mkv_path, opts.duration, &stopping);
-    let _ = pipeline.set_state(gst::State::Null);
-    result?;
-
-    // ---- Finish ---------------------------------------------------------------------
-    let size = std::fs::metadata(&mkv_path).map(|m| m.len()).unwrap_or(0);
-    let lost = stats.lost.load(Ordering::Relaxed);
-    if lost > 0 {
-        log::warn(&format!("{lost} frame(s) were lost during the recording"));
-    } else {
-        log::ok("no frames lost");
-    }
-
-    let add_mix = opts.mix_track && opts.mic.is_some() && game_audio;
-    if container == Container::Mp4 || add_mix {
-        let what = match (add_mix, container) {
-            (true, Container::Mp4) => "mixing Game + Mic and converting to MP4",
-            (true, Container::Mkv) => "mixing Game + Mic",
-            _ => "converting to MP4",
-        };
+    let mut warned_lost = 0u64;
+    let watched = session.watch(opts.duration, Duration::from_secs(5), |st| {
+        let left = st
+            .drive_left
+            .map(|s| format!(", {} left on drive", estimate::human_duration(s)))
+            .unwrap_or_default();
         println!(
-            "{} {what} (video is copied, not re-encoded)",
-            log::dim("finishing:")
+            "  {}  {}  {:.1} Mbit/s  {:.2} fps{left}",
+            estimate::human_duration(st.elapsed),
+            estimate::human_bytes(st.size as f64),
+            st.mbps,
+            st.fps,
         );
-        let mix = add_mix.then_some((opts.audio_codec, opts.audio_kbps));
-        match remux::finalize(&mkv_path, &final_path, container == Container::Mp4, mix) {
-            Ok(()) => {
-                let out_size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-                log::ok(&format!(
-                    "saved {} ({})",
-                    final_path.display(),
-                    estimate::human_bytes(out_size as f64)
-                ));
-            }
-            Err(e) => {
-                log::warn(&format!(
-                    "finishing failed ({e}); your recording is safe as MKV with separate tracks"
-                ));
-                log::ok(&format!(
-                    "saved {} ({})",
-                    mkv_path.display(),
-                    estimate::human_bytes(size as f64)
-                ));
-            }
+        if st.lost > warned_lost {
+            log::warn(&format!("{} frame(s) lost so far", st.lost));
+            warned_lost = st.lost;
         }
-    } else {
+    });
+
+    let add_mix = opts.mix_track && opts.mic.is_some() && session.plan.game_audio;
+    if watched.is_ok() && (add_mix || session.plan.container == Container::Mp4) {
+        println!(
+            "{} {} (video is copied, not re-encoded)",
+            log::dim("finishing:"),
+            match (add_mix, session.plan.container) {
+                (true, Container::Mp4) => "mixing Game + Mic and converting to MP4",
+                (true, Container::Mkv) => "mixing Game + Mic",
+                _ => "converting to MP4",
+            }
+        );
+    }
+    let done = session.finish(opts);
+    watched?;
+    if let Some(f) = done {
+        if f.lost > 0 {
+            log::warn(&format!(
+                "{} frame(s) were lost during the recording",
+                f.lost
+            ));
+        } else {
+            log::ok("no frames lost");
+        }
+        if let Some(e) = &f.finish_error {
+            log::warn(&format!(
+                "finishing failed ({e}); your recording is safe as MKV with separate tracks"
+            ));
+        }
         log::ok(&format!(
             "saved {} ({})",
-            mkv_path.display(),
-            estimate::human_bytes(size as f64)
+            f.path.display(),
+            estimate::human_bytes(f.size as f64)
         ));
     }
     Ok(())
 }
 
-/// Audio source -> 48 kHz stereo -> [volume] -> tee -> encoder -> mux, plus a branch
-/// to the speakers for the game audio while previewing. A nonzero offset shifts the
-/// whole track.
+/// Audio source -> 48 kHz stereo -> [volume] -> tee -> [encoder -> mux] and/or
+/// [speakers]. A nonzero offset shifts the whole track.
+#[allow(clippy::too_many_arguments)]
 fn add_audio_track(
     pipeline: &gst::Pipeline,
     src: gst::Element,
-    mux: &gst::Element,
+    mux: Option<&gst::Element>,
     title: &str,
     offset_ms: i64,
     volume_pct: f64,
+    listen: bool,
     opts: &Options,
 ) -> Result<(), String> {
     let caps = make("capsfilter")?;
@@ -388,15 +650,17 @@ fn add_audio_track(
         pad.set_offset(offset_ms * 1_000_000);
     }
 
-    let mut enc = vec![make("queue")?];
-    enc.extend(encode::audio_chain(opts.audio_codec, opts.audio_kbps)?);
-    add_chain(pipeline, &enc, title)?;
-    tee.link(&enc[0])
-        .map_err(|_| format!("could not connect the {title} track"))?;
-    link_to_mux(enc.last().unwrap(), mux, title)?;
+    if let Some(mux) = mux {
+        let mut enc = vec![make("queue")?];
+        enc.extend(encode::audio_chain(opts.audio_codec, opts.audio_kbps)?);
+        add_chain(pipeline, &enc, title)?;
+        tee.link(&enc[0])
+            .map_err(|_| format!("could not connect the {title} track"))?;
+        link_to_mux(enc.last().unwrap(), mux, title)?;
+    }
 
-    if opts.preview && title == "Game" {
-        // Play the game audio while the preview window is open.
+    if listen {
+        // Play this track on the speakers while the preview is showing.
         let q = make("queue")?;
         q.set_property_from_str("leaky", "downstream");
         let listen = [q, make("audioconvert")?, make("autoaudiosink")?];
@@ -544,86 +808,6 @@ impl FrameStats {
     }
 }
 
-fn watch(
-    pipeline: &gst::Pipeline,
-    stats: &FrameStats,
-    file: &Path,
-    duration: Option<f64>,
-    stopping: &AtomicBool,
-) -> Result<(), String> {
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
-    let start = Instant::now();
-    let mut last = (Instant::now(), 0u64);
-    let mut warned_lost = 0u64;
-    loop {
-        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
-            use gst::MessageView;
-            match msg.view() {
-                MessageView::Eos(_) => return Ok(()),
-                MessageView::Error(e) => {
-                    let text = e.error().to_string();
-                    if text.contains("window was closed") {
-                        // Closing the preview stops the recording cleanly.
-                        if !stopping.swap(true, Ordering::SeqCst) {
-                            println!("{}", log::yellow("preview closed, finishing the recording"));
-                            pipeline.send_event(gst::event::Eos::new());
-                        }
-                        continue;
-                    }
-                    let debug = e.debug().map(|d| d.to_string()).unwrap_or_default();
-                    log::debug(&format!(
-                        "from {:?}: {debug}",
-                        e.src().map(|s| s.path_string())
-                    ));
-                    return Err(format!(
-                        "{text} (the MKV recorded so far is still playable)"
-                    ));
-                }
-                MessageView::Warning(w) => log::warn(&w.error().to_string()),
-                _ => {}
-            }
-        }
-
-        if let Some(d) = duration {
-            if start.elapsed().as_secs_f64() >= d && !stopping.swap(true, Ordering::SeqCst) {
-                println!(
-                    "{} reached --duration, finishing the file",
-                    log::dim("stopping:")
-                );
-                pipeline.send_event(gst::event::Eos::new());
-            }
-        }
-
-        if last.0.elapsed() >= Duration::from_secs(5) && !stopping.load(Ordering::Relaxed) {
-            let frames = stats.frames.load(Ordering::Relaxed);
-            let fps = (frames - last.1) as f64 / last.0.elapsed().as_secs_f64();
-            let elapsed = start.elapsed().as_secs_f64();
-            let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0) as f64;
-            let bytes_per_sec = size / elapsed.max(1.0);
-            let left = estimate::free_space(file)
-                .map(|free| {
-                    format!(
-                        ", {} left on drive",
-                        estimate::human_duration(free as f64 / bytes_per_sec.max(1.0))
-                    )
-                })
-                .unwrap_or_default();
-            println!(
-                "  {}  {}  {:.1} Mbit/s  {fps:.2} fps{left}",
-                estimate::human_duration(elapsed),
-                estimate::human_bytes(size),
-                bytes_per_sec * 8.0 / 1e6,
-            );
-            let lost = stats.lost.load(Ordering::Relaxed);
-            if lost > warned_lost {
-                log::warn(&format!("{lost} frame(s) lost so far"));
-                warned_lost = lost;
-            }
-            last = (Instant::now(), frames);
-        }
-    }
-}
-
 // ---- Output and messages ------------------------------------------------------------
 
 fn with_extension(p: &Path, c: Container) -> PathBuf {
@@ -643,7 +827,7 @@ fn default_output() -> PathBuf {
         .join(format!("Lucentia {}.mkv", local_timestamp()))
 }
 
-fn local_timestamp() -> String {
+pub(crate) fn local_timestamp() -> String {
     // SAFETY: time() and localtime_r() only write into the struct we pass.
     unsafe {
         let t = libc::time(std::ptr::null_mut());
@@ -661,18 +845,16 @@ fn local_timestamp() -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_plan(
-    card: Option<&CaptureDevice>,
-    mode: &Mode,
-    hdr: bool,
-    v: &VideoSettings,
-    opts: &Options,
-    audio_tracks: u32,
-    container: Container,
-    path: &Path,
-    est: estimate::Rate,
-) {
+fn print_plan(card: Option<&CaptureDevice>, plan: &Plan, opts: &Options) {
+    let (mode, hdr, v, audio_tracks, container, path, est) = (
+        &plan.mode,
+        plan.hdr,
+        &plan.video,
+        plan.audio_tracks,
+        plan.container,
+        &plan.final_path,
+        plan.est,
+    );
     let source = card.map(|c| c.name.as_str()).unwrap_or("test pattern");
     let depth = if mode.ten_bit() { "10-bit" } else { "8-bit" };
     println!(
@@ -776,6 +958,64 @@ fn check_disk(path: &Path, est: estimate::Rate, codec: Codec) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Preview-only session sending frames to a callback, the way the app window uses
+    /// it: HDR test pattern in, tone-mapped 1280x720 RGBA frames out. Needs OpenGL, so
+    /// it's opt-in: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn app_preview_delivers_frames() {
+        gst::init().unwrap();
+        let got: Arc<Mutex<Vec<(u32, u32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_got = got.clone();
+        let opts = Options {
+            capture: preview::Options {
+                mode: Some((1920, 1080, 30.0)),
+                hdr: true,
+                mjpeg: false,
+                hdr_signal: false,
+                audio: true,
+            },
+            codec: None,
+            rate: None,
+            keyframe_secs: 2.0,
+            analysis: false,
+            audio_codec: AudioCodec::Aac,
+            audio_kbps: 320,
+            mic: None,
+            mic_offset_ms: 0,
+            mix_track: false,
+            game_volume: 100.0,
+            mic_volume: 100.0,
+            container: Container::Mkv,
+            output: None,
+            duration: Some(2.0),
+            preview: false,
+            test_source: true,
+            record: false,
+            frames: Some(Arc::new(move |f: preview::Frame| {
+                let max = f.rgba.iter().step_by(4).copied().max().unwrap_or(0);
+                assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
+                sink_got.lock().unwrap().push((f.width, f.height, max));
+            })),
+        };
+        let plan = plan(None, &opts).unwrap();
+        let session = start(None, &opts, plan).unwrap();
+        session
+            .watch(opts.duration, Duration::from_secs(1), |_| {})
+            .unwrap();
+        assert!(
+            session.finish(&opts).is_none(),
+            "preview-only writes no file"
+        );
+        let got = got.lock().unwrap();
+        assert!(got.len() > 10, "only {} frames arrived", got.len());
+        assert_eq!((got[0].0, got[0].1), (1280, 720));
+        assert!(
+            got.iter().any(|f| f.2 > 200),
+            "frames look washed out / dark"
+        );
+    }
 
     #[test]
     fn default_bitrate_scales_with_mode() {

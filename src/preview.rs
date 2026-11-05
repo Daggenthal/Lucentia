@@ -278,6 +278,116 @@ pub(crate) fn display_chain(hdr: bool) -> Result<Vec<gst::Element>, String> {
     Ok(chain)
 }
 
+/// A preview frame for the app window: tightly packed RGBA, already tone-mapped.
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Where preview frames go when the app window is showing them.
+pub type FrameSink = std::sync::Arc<dyn Fn(Frame) + Send + Sync>;
+
+/// Preview frames for the app window: convert, tone map HDR and shrink on the GPU,
+/// then hand small RGBA frames (e.g. 1280x720) to `sink`. Only the preview is scaled;
+/// recordings keep full resolution. Falls back to the CPU without OpenGL.
+pub(crate) fn frames_chain(
+    hdr: bool,
+    width: u32,
+    height: u32,
+    sink: FrameSink,
+) -> Result<Vec<gst::Element>, String> {
+    let rgba = |gl: bool| {
+        let b = gst::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("width", width as i32)
+            .field("height", height as i32);
+        if gl {
+            b.features(["memory:GLMemory"]).build()
+        } else {
+            b.build()
+        }
+    };
+    let mut chain = Vec::new();
+    match (
+        make("glupload"),
+        make("glcolorconvert"),
+        make("glcolorscale"),
+        make("gldownload"),
+    ) {
+        (Ok(up), Ok(conv), Ok(scale), Ok(down)) => {
+            chain.push(up);
+            chain.push(conv);
+            if hdr {
+                let tm = make("glshader")?;
+                tm.set_property("fragment", TONEMAP_SHADER);
+                chain.push(tm);
+            }
+            chain.push(scale);
+            let gl_caps = make("capsfilter")?;
+            gl_caps.set_property("caps", rgba(true));
+            chain.push(gl_caps);
+            chain.push(down);
+        }
+        _ => {
+            log::warn("OpenGL elements missing, scaling the preview on the CPU");
+            chain.push(make("videoconvert")?);
+            chain.push(make("videoscale")?);
+        }
+    }
+    let caps = make("capsfilter")?;
+    caps.set_property("caps", rgba(false));
+    chain.push(caps);
+
+    let appsink = gstreamer_app::AppSink::builder()
+        .sync(false)
+        .max_buffers(1)
+        .drop(true)
+        .build();
+    appsink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |s| {
+                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Some(frame) = sample_to_frame(&sample) {
+                    sink(frame);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    chain.push(appsink.upcast());
+    Ok(chain)
+}
+
+/// Copy a sample into a tightly packed RGBA frame, dropping any row padding.
+fn sample_to_frame(sample: &gst::Sample) -> Option<Frame> {
+    use gstreamer_video::prelude::*;
+    let caps = sample.caps()?;
+    let info = gstreamer_video::VideoInfo::from_caps(caps).ok()?;
+    let buffer = sample.buffer()?;
+    let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
+    let (w, h) = (info.width() as usize, info.height() as usize);
+    let stride = frame.plane_stride()[0] as usize;
+    let data = frame.plane_data(0).ok()?;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        rgba.extend_from_slice(&data[row * stride..row * stride + w * 4]);
+    }
+    Some(Frame {
+        width: w as u32,
+        height: h as u32,
+        rgba,
+    })
+}
+
+/// Preview size for a mode: 1280 wide (or the mode's own width if smaller), keeping
+/// the aspect ratio, rounded to even numbers.
+pub fn preview_size(mode: &Mode) -> (u32, u32) {
+    let w = mode.width.min(1280).max(2) as u32;
+    let h = ((w as f64 * mode.height as f64 / mode.width.max(1) as f64).round() as u32).max(2);
+    (w & !1, h & !1)
+}
+
 pub fn run(card: &CaptureDevice, opts: &Options) -> Result<(), String> {
     let mode = choose_mode(card, opts)?;
     let label = format!(

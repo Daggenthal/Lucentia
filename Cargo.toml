@@ -9,8 +9,15 @@ authors = ["Daggenthal"]
 
 [dependencies]
 gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
 libc = "0.2"
 ctrlc = "3"
+slint = "1.18"
+rfd = "0.17"
+
+[build-dependencies]
+slint-build = "1.18"
 
 [profile.release]
 lto = true

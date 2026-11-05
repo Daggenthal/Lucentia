@@ -94,6 +94,9 @@ pub fn human_bytes(b: f64) -> String {
 }
 
 pub fn human_duration(secs: f64) -> String {
+    if secs >= 100.0 * 3600.0 {
+        return "100h+".to_string();
+    }
     let s = secs.max(0.0) as u64;
     let (h, m, s) = (s / 3600, (s % 3600) / 60, s % 60);
     if h > 0 {
@@ -183,6 +186,7 @@ mod tests {
     fn formats_durations_and_sizes() {
         assert_eq!(human_duration(3725.0), "1h 02m");
         assert_eq!(human_duration(65.0), "1m 05s");
+        assert_eq!(human_duration(1e12), "100h+");
         assert_eq!(human_bytes(18e9), "18.0 GB");
         assert_eq!(human_bytes(300e6), "300 MB");
     }

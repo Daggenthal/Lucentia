@@ -1,7 +1,8 @@
 //! Lucentia: Capture app for Elgato (and other UVC) capture cards.
 //!
 //! Commands:
-//!   lucentia                 list capture devices and their modes
+//!   lucentia                 open the app window
+//!   lucentia list            list capture devices and their modes
 //!   lucentia preview [opts]  live preview with sound
 //!   lucentia record [opts]   record to a file
 //!   lucentia mics            list microphones
@@ -14,6 +15,7 @@ mod log;
 mod preview;
 mod record;
 mod remux;
+mod ui;
 
 use devices::{Kind, Mode};
 use encode::{AudioCodec, Codec, RateControl};
@@ -23,7 +25,8 @@ use std::path::PathBuf;
 
 const USAGE: &str = "\
 Usage:
-  lucentia                      List capture devices and the modes they support
+  lucentia                      Open the app window
+  lucentia list                 List capture devices and the modes they support
   lucentia preview [options]    Live preview with sound
   lucentia record [options]     Record to a file (Ctrl+C to stop)
   lucentia mics                 List microphones
@@ -78,16 +81,28 @@ fn main() {
         || std::env::var("LUCENTIA_DEBUG").is_ok_and(|v| v != "0");
     log::init_debug(debug);
 
-    // The OpenGL preview window opens tiny and can't be resized when GStreamer picks
-    // its Wayland window. Its X11 window (through XWayland) sizes itself to the video,
-    // so use that when an X display exists. Set GST_GL_WINDOW yourself to override.
-    // This must happen before GStreamer starts any threads.
-    if cfg!(target_os = "linux")
-        && std::env::var_os("GST_GL_WINDOW").is_none()
-        && std::env::var_os("DISPLAY").is_some()
-    {
-        std::env::set_var("GST_GL_WINDOW", "x11");
-        log::debug("using the X11 OpenGL window for the preview");
+    let cmd = args
+        .first()
+        .map(String::as_str)
+        .filter(|c| !c.starts_with('-'));
+
+    // How GStreamer's OpenGL work connects to the display. This must happen before
+    // GStreamer starts any threads. Setting GST_GL_WINDOW yourself overrides it.
+    if cfg!(target_os = "linux") && std::env::var_os("GST_GL_WINDOW").is_none() {
+        if cmd.is_none() {
+            // App window: GStreamer only needs the GPU, not a window, because frames go
+            // to the UI. Keeping it off the X11/Wayland connection stops it from
+            // deadlocking with the UI's own OpenGL drawing.
+            std::env::set_var("GST_GL_PLATFORM", "egl");
+            std::env::set_var("GST_GL_WINDOW", "surfaceless");
+            log::debug("GStreamer OpenGL: EGL surfaceless (app window)");
+        } else if std::env::var_os("DISPLAY").is_some() {
+            // Command-line preview: the OpenGL window opens tiny and can't be resized
+            // when GStreamer picks Wayland. Its X11 window (through XWayland) sizes
+            // itself to the video.
+            std::env::set_var("GST_GL_WINDOW", "x11");
+            log::debug("using the X11 OpenGL window for the preview");
+        }
     }
 
     if let Err(e) = gst::init() {
@@ -96,14 +111,10 @@ fn main() {
     }
     log::debug(&format!("GStreamer {}", gst::version_string()));
 
-    let cmd = args
-        .first()
-        .map(String::as_str)
-        .filter(|c| !c.starts_with('-'));
     match cmd {
         Some("mics") => return list_mics(),
         Some("finish") => return run_finish(&args[1..]),
-        Some("preview") | Some("record") | None => {}
+        Some("preview") | Some("record") | Some("list") | None => {}
         Some(other) => {
             log::error(&format!("unknown command `{other}`\n\n{USAGE}"));
             std::process::exit(64);
@@ -120,13 +131,21 @@ fn main() {
     };
     if devs.is_empty() && !test_source {
         log::warn("no capture devices found. Is the card plugged in?");
-        std::process::exit(2);
+        if cmd.is_some() {
+            std::process::exit(2);
+        }
     }
 
     match cmd {
         Some("preview") => run_preview(&args[1..], &devs),
         Some("record") => run_record(&args[1..], &devs),
-        _ => list(&devs),
+        Some("list") => list(&devs),
+        _ => {
+            if let Err(e) = ui::run(devs, test_source) {
+                log::error(&e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -295,6 +314,8 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
         duration: None,
         preview: false,
         test_source: false,
+        record: true,
+        frames: None,
     };
     let mut index = 1usize;
     let mbps = |v: &str, flag: &str| -> u32 {

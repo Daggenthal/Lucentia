@@ -6,6 +6,8 @@ A capture app for the Elgato 4K X and other USB capture cards, built for Linux f
 
 Early days. Right now Lucentia can:
 
+- Open an app window with a live preview, settings, and Record/Stop, with light, dark or system theme
+
 - Find your capture card and list every mode it supports, marked as lossless (uncompressed) or MJPEG (compressed on the card), with 10-bit HDR modes flagged
 - Show a live preview with the card's audio, found automatically, and report the real frame rate
 - Tone map HDR in the preview so it doesn't look washed out
@@ -18,7 +20,6 @@ Tested on: SteamOS with an Elgato 4K X.
 
 ## Planned
 
-- A real app window with the preview and a settings panel
 - Mic level meters and live monitoring
 - Use Lucentia as a source in OBS for streaming
 - AppImage for any Linux distro, with Windows and macOS builds later
@@ -29,15 +30,19 @@ Needs Rust and the GStreamer development packages. On Arch (or an Arch distrobox
 
 ```
 sudo pacman -S rustup base-devel pkgconf gstreamer gst-plugins-base gst-plugins-good \
-  gst-plugins-bad gst-plugin-va gst-plugin-pipewire gst-libav
+  gst-plugins-bad gst-plugin-va gst-plugin-pipewire gst-libav fontconfig libxkbcommon wayland
 rustup default stable
 cargo run --release
 ```
 
 ## Usage
 
+Run `cargo run --release` to open the app. Pick your card, resolution and frame rate on the right (10-bit HDR shows up when the card offers it), set the codec and bitrate, and press Record. The size estimate updates as you change settings. When a recording finishes, Lucentia asks where to save it and what to call it (you can turn that off under Output).
+
+Everything also works from the terminal:
+
 ```
-cargo run --release                                    # list capture devices and their modes
+cargo run --release -- list                            # list capture devices and their modes
 cargo run --release -- preview                         # live preview at 1080p60
 cargo run --release -- preview --mode 1920x1080@120    # any mode from the list
 cargo run --release -- preview --mode 2560x1440@60 --hdr
@@ -78,3 +83,5 @@ Recent Elgato USB cards (HD60 X, 4K S, Neo, Cam Link) use standard UVC like the 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The app window is built with [Slint](https://slint.dev), used under its royalty-free license, which asks for the "About Slint" credit shown in the app's About section. Made with Slint. 💙

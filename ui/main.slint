@@ -1,0 +1,458 @@
+// Lucentia's main window: live preview on the left, settings on the right.
+
+import { Button, CheckBox, ComboBox, SpinBox, Slider, ScrollView, GroupBox, AboutSlint, LineEdit, Palette } from "std-widgets.slint";
+
+component Label inherits Text {
+    color: Palette.foreground.transparentize(0.3);
+    font-size: 12px;
+    vertical-alignment: center;
+}
+
+component Row inherits HorizontalLayout {
+    spacing: 8px;
+    alignment: stretch;
+}
+
+component Hint inherits Text {
+    color: Palette.foreground.transparentize(0.4);
+    font-size: 11px;
+    wrap: word-wrap;
+}
+
+component Stat inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <color> value-color: Palette.foreground;
+    spacing: 2px;
+    Text { text: root.label; color: Palette.foreground.transparentize(0.4); font-size: 10px; }
+    Text { text: root.value; color: root.value-color; font-size: 15px; font-weight: 600; }
+}
+
+export component AppWindow inherits Window {
+    title: "Lucentia";
+    preferred-width: 1360px;
+    preferred-height: 800px;
+    min-width: 960px;
+    min-height: 600px;
+    background: Palette.background;
+
+    // Preview
+    in property <image> preview;
+    in property <bool> has-preview: false;
+    in property <string> preview-message: "Starting preview…";
+
+    // Source
+    in property <[string]> devices;
+    in-out property <int> device-index: 0;
+    in property <[string]> resolutions;
+    in-out property <int> resolution-index: 0;
+    in property <[string]> rates;
+    in-out property <int> rate-index: 0;
+    in property <bool> hdr-available: false;
+    in-out property <bool> hdr: false;
+    in-out property <bool> hdr-signal: false;
+    in property <string> mode-note;
+
+    // Video
+    in property <[string]> codecs: ["HEVC", "AV1", "H.264", "Raw (uncompressed)"];
+    in-out property <int> codec-index: 0;
+    in property <[string]> rate-modes: ["Constant bitrate (CBR)", "Variable bitrate (VBR)", "Constant quality"];
+    in-out property <int> rate-mode-index: 0;
+    in-out property <int> bitrate: 40;
+    in-out property <int> quality: 20;
+    in-out property <bool> analysis: false;
+    in property <string> estimate;
+
+    // Audio
+    in-out property <bool> game-audio: true;
+    in-out property <float> game-volume: 100;
+    in property <[string]> mics;
+    in-out property <int> mic-index: 0;
+    in-out property <float> mic-volume: 100;
+    in-out property <int> mic-offset: 0;
+    in-out property <bool> mix-track: true;
+
+    // Output
+    in property <[string]> formats: ["MKV (recommended)", "MP4"];
+    in-out property <int> format-index: 0;
+    in property <string> output-folder;
+    in-out property <bool> ask-save: true;
+    callback ask-save-changed(bool);
+
+    // Session
+    in property <bool> recording: false;
+    in property <bool> busy: false;
+    in property <string> fps-text: "–";
+    in property <string> time-text: "0:00";
+    in property <string> size-text: "–";
+    in property <string> bitrate-text: "–";
+    in property <string> lost-text: "0";
+    in property <bool> lost-warning: false;
+    in property <string> drive-text: "–";
+    in property <string> message;
+    in property <bool> message-is-error: false;
+    in property <bool> message-is-success: false;
+    in property <string> version;
+
+    // Appearance: 0 = follow the system, 1 = light, 2 = dark.
+    in-out property <int> theme-index: 0;
+    callback theme-changed(int);
+    public function apply-theme() {
+        Palette.color-scheme = root.theme-index == 1 ? ColorScheme.light
+            : root.theme-index == 2 ? ColorScheme.dark
+            : ColorScheme.unknown;
+    }
+
+    callback device-changed();
+    callback mode-changed();
+    callback settings-changed();
+    callback record-clicked();
+    callback choose-folder();
+    callback open-folder();
+
+    HorizontalLayout {
+        // ---- Preview -------------------------------------------------------------
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            horizontal-stretch: 1;
+
+            Rectangle {
+                vertical-stretch: 1;
+                background: #000000;
+                border-radius: 8px;
+                clip: true;
+
+                if root.has-preview: Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.preview;
+                    image-fit: contain;
+                }
+                if !root.has-preview: Text {
+                    text: root.preview-message;
+                    color: #8a93a3;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                // Recording badge.
+                if root.recording: Rectangle {
+                    x: 14px;
+                    y: 14px;
+                    width: badge.preferred-width + 24px;
+                    height: 28px;
+                    border-radius: 14px;
+                    background: #000000b0;
+                    badge := HorizontalLayout {
+                        padding-left: 12px;
+                        spacing: 8px;
+                        alignment: start;
+                        Rectangle {
+                            width: 10px;
+                            height: 10px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 5px;
+                            background: #ff4d4f;
+                        }
+                        Text {
+                            text: "REC  " + root.time-text + "   ·   " + root.size-text + "   ·   " + root.bitrate-text;
+                            color: #ffffff;
+                            font-size: 13px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Live stats.
+            HorizontalLayout {
+                spacing: 28px;
+                padding-left: 4px;
+                Stat { label: "FRAME RATE"; value: root.fps-text; }
+                Stat {
+                    label: "LOST FRAMES";
+                    value: root.lost-text;
+                    value-color: root.lost-warning ? #e09000 : Palette.foreground;
+                }
+                Stat { label: "RECORDED"; value: root.recording ? root.time-text : "–"; }
+                Stat { label: "FILE SIZE"; value: root.size-text; }
+                Stat { label: "BITRATE"; value: root.recording ? root.bitrate-text : "–"; }
+                Stat { label: "DRIVE"; value: root.drive-text; }
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            if root.message != "": Rectangle {
+                height: msg.preferred-height + 16px;
+                border-radius: 6px;
+                background: root.message-is-error ? #d0303033
+                    : root.message-is-success ? #20a04a2e
+                    : #e0a00026;
+                msg := Text {
+                    x: 12px;
+                    width: parent.width - 24px;
+                    text: root.message;
+                    color: Palette.foreground;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // ---- Settings ------------------------------------------------------------
+        Rectangle {
+            width: 380px;
+            background: Palette.alternate-background;
+
+            VerticalLayout {
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 14px;
+
+                        Text {
+                            text: "Lucentia";
+                            color: Palette.foreground;
+                            font-size: 22px;
+                            font-weight: 700;
+                        }
+
+                        GroupBox {
+                            title: "Source";
+                            enabled: !root.recording && !root.busy;
+                            VerticalLayout {
+                                spacing: 8px;
+                                ComboBox {
+                                    model: root.devices;
+                                    current-index <=> root.device-index;
+                                    selected => { root.device-changed(); }
+                                }
+                                Row {
+                                    ComboBox {
+                                        horizontal-stretch: 2;
+                                        model: root.resolutions;
+                                        current-index <=> root.resolution-index;
+                                        selected => { root.mode-changed(); }
+                                    }
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.rates;
+                                        current-index <=> root.rate-index;
+                                        selected => { root.mode-changed(); }
+                                    }
+                                }
+                                CheckBox {
+                                    text: "10-bit HDR";
+                                    enabled: root.hdr-available;
+                                    checked <=> root.hdr;
+                                    toggled => { root.mode-changed(); }
+                                }
+                                CheckBox {
+                                    text: "Source is HDR in 8-bit (tone map it)";
+                                    enabled: !root.hdr;
+                                    checked <=> root.hdr-signal;
+                                    toggled => { root.mode-changed(); }
+                                }
+                                Hint { text: root.mode-note; }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Video";
+                            enabled: !root.recording && !root.busy;
+                            VerticalLayout {
+                                spacing: 8px;
+                                Row {
+                                    Label { text: "Codec"; width: 90px; }
+                                    ComboBox {
+                                        model: root.codecs;
+                                        current-index <=> root.codec-index;
+                                        selected => { root.settings-changed(); }
+                                    }
+                                }
+                                Row {
+                                    Label { text: "Rate control"; width: 90px; }
+                                    ComboBox {
+                                        model: root.rate-modes;
+                                        enabled: root.codec-index != 3;
+                                        current-index <=> root.rate-mode-index;
+                                        selected => { root.settings-changed(); }
+                                    }
+                                }
+                                if root.rate-mode-index != 2 && root.codec-index != 3: Row {
+                                    Label { text: "Bitrate (Mbit/s)"; width: 90px; }
+                                    SpinBox {
+                                        minimum: 1;
+                                        maximum: 1000;
+                                        value <=> root.bitrate;
+                                        edited => { root.settings-changed(); }
+                                    }
+                                }
+                                if root.rate-mode-index == 2 && root.codec-index != 3: Row {
+                                    Label { text: "Quality (0 best)"; width: 90px; }
+                                    SpinBox {
+                                        minimum: 0;
+                                        maximum: 51;
+                                        value <=> root.quality;
+                                        edited => { root.settings-changed(); }
+                                    }
+                                }
+                                CheckBox {
+                                    text: "Analysis mode (every frame a keyframe)";
+                                    enabled: root.codec-index != 3;
+                                    checked <=> root.analysis;
+                                    toggled => { root.settings-changed(); }
+                                }
+                                Text {
+                                    text: root.estimate;
+                                    color: Palette.foreground.transparentize(0.15);
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Audio";
+                            enabled: !root.recording && !root.busy;
+                            VerticalLayout {
+                                spacing: 8px;
+                                CheckBox {
+                                    text: "Game audio";
+                                    checked <=> root.game-audio;
+                                    toggled => { root.settings-changed(); }
+                                }
+                                Row {
+                                    Label { text: "Game " + round(root.game-volume) + "%"; width: 90px; }
+                                    Slider {
+                                        minimum: 0;
+                                        maximum: 200;
+                                        value <=> root.game-volume;
+                                        released => { root.settings-changed(); }
+                                    }
+                                }
+                                Row {
+                                    Label { text: "Mic"; width: 90px; }
+                                    ComboBox {
+                                        model: root.mics;
+                                        current-index <=> root.mic-index;
+                                        selected => { root.settings-changed(); }
+                                    }
+                                }
+                                if root.mic-index > 0: Row {
+                                    Label { text: "Mic " + round(root.mic-volume) + "%"; width: 90px; }
+                                    Slider {
+                                        minimum: 0;
+                                        maximum: 200;
+                                        value <=> root.mic-volume;
+                                        released => { root.settings-changed(); }
+                                    }
+                                }
+                                if root.mic-index > 0: Row {
+                                    Label { text: "Mic sync (ms)"; width: 90px; }
+                                    SpinBox {
+                                        minimum: -500;
+                                        maximum: 500;
+                                        value <=> root.mic-offset;
+                                        edited => { root.settings-changed(); }
+                                    }
+                                }
+                                if root.mic-index > 0: CheckBox {
+                                    text: "Add a Game + Mic track (plays by default)";
+                                    checked <=> root.mix-track;
+                                    toggled => { root.settings-changed(); }
+                                }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Output";
+                            enabled: !root.recording && !root.busy;
+                            VerticalLayout {
+                                spacing: 8px;
+                                ComboBox {
+                                    model: root.formats;
+                                    current-index <=> root.format-index;
+                                    selected => { root.settings-changed(); }
+                                }
+                                Hint {
+                                    text: root.format-index == 0
+                                        ? "Still playable if the app, the system or the power cuts out mid-recording, and players show the track names."
+                                        : "Recorded as MKV for safety, then converted to MP4 when you stop. For editors or sites that only take MP4.";
+                                }
+                                Row {
+                                    LineEdit {
+                                        text: root.output-folder;
+                                        read-only: true;
+                                    }
+                                    Button {
+                                        text: "Change";
+                                        clicked => { root.choose-folder(); }
+                                    }
+                                }
+                                CheckBox {
+                                    text: "Ask where to save each recording";
+                                    checked <=> root.ask-save;
+                                    toggled => { root.ask-save-changed(root.ask-save); }
+                                }
+                                Button {
+                                    text: "Open recordings folder";
+                                    clicked => { root.open-folder(); }
+                                }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Appearance";
+                            ComboBox {
+                                model: ["Auto (follow system)", "Light", "Dark"];
+                                current-index <=> root.theme-index;
+                                selected => {
+                                    root.apply-theme();
+                                    root.theme-changed(root.theme-index);
+                                }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "About";
+                            VerticalLayout {
+                                spacing: 8px;
+                                Hint {
+                                    text: "Lucentia " + root.version + " by Daggenthal. MIT licensed. Captures from Elgato and other UVC cards with GStreamer.";
+                                }
+                                AboutSlint { }
+                            }
+                        }
+                    }
+                }
+
+                // Record button, always visible.
+                VerticalLayout {
+                    padding: 16px;
+                    Rectangle {
+                        height: 48px;
+                        border-radius: 8px;
+                        background: root.busy ? #6b7280
+                            : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
+                            : (touch.has-hover ? #e04548 : #d23a3d);
+                        Text {
+                            text: root.busy ? "Finishing…" : root.recording ? "Stop recording" : "Record";
+                            color: #ffffff;
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                        touch := TouchArea {
+                            enabled: !root.busy;
+                            clicked => { root.record-clicked(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
