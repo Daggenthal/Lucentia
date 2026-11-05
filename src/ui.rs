@@ -106,6 +106,10 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             .iter()
             .map(|d| d.display_name().to_string()),
     );
+    if test_source {
+        // With the test pattern, the mic is a test tone (any name works).
+        mics.push("Test tone".to_string());
+    }
     ui.set_mics(strings(mics.iter().map(SharedString::from).collect()));
 
     let state = Rc::new(RefCell::new(State {
@@ -706,7 +710,13 @@ fn start_recording(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     };
     match result {
         Ok(plan) => {
-            let mut text = vec![format!("Recording to {}", plan.final_path.display())];
+            // Just the file name: the folder is under Settings > Output.
+            let name = plan
+                .final_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| plan.final_path.display().to_string());
+            let mut text = vec![format!("Recording to {name}")];
             text.extend(plan.warnings);
             show(ui, &text.join(" "), false);
             ui.set_recording(true);
@@ -807,7 +817,7 @@ fn show_stats(ui: &AppWindow, st: &record::Stats) {
         ui.set_bitrate_text(format!("{:.1} Mbit/s", st.mbps).into());
         ui.set_drive_text(
             st.drive_left
-                .map(|s| format!("{} left", estimate::human_duration(s)))
+                .map(|s| estimate::human_duration(s))
                 .unwrap_or_else(|| "–".into())
                 .into(),
         );

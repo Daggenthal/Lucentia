@@ -37,7 +37,7 @@ cargo run --release
 
 ## Usage
 
-Run `cargo run --release` to open the app. Pick your card, resolution and frame rate on the right (10-bit HDR shows up when the card offers it), set the codec and bitrate, and press Record. The size estimate updates as you change settings. For 40 fps games (like 40 Hz modes on handhelds), pick "40 fps (from 120 Hz)": Lucentia captures at 120 Hz and keeps every third frame, so set the source to output 120 Hz. On the command line that's `--mode 1920x1080@120 --record-fps 40`. When a recording finishes, Lucentia asks where to save it and what to call it (you can turn that off under Output).
+Run `cargo run --release` to open the app. Open Settings (top right) to pick your card, resolution and frame rate (10-bit HDR shows up when the card offers it) and set the codec and bitrate, then press Record. The Audio and Mic buttons under the video mute your speakers or your mic, even mid-recording. The size estimate updates as you change settings. For 40 fps games (like 40 Hz modes on handhelds), pick "40 fps (from 120 Hz)": Lucentia captures at 120 Hz and keeps every third frame, so set the source to output 120 Hz. On the command line that's `--mode 1920x1080@120 --record-fps 40`. When a recording finishes, Lucentia asks where to save it and what to call it (you can turn that off under Output).
 
 Everything also works from the terminal:
 

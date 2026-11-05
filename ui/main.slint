@@ -52,11 +52,35 @@ component MuteButton inherits Rectangle {
     }
 }
 
+// Record / Stop.
+component RecordButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> busy: false;
+    in property <bool> recording: false;
+    callback clicked();
+    height: 44px;
+    border-radius: 8px;
+    background: root.busy ? #6b7280
+        : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
+        : (touch.has-hover ? #e04548 : #d23a3d);
+    Text {
+        text: root.text;
+        color: #ffffff;
+        font-size: 16px;
+        font-weight: 700;
+    }
+    touch := TouchArea {
+        enabled: !root.busy;
+        clicked => { root.clicked(); }
+    }
+}
+
 component Stat inherits VerticalLayout {
     in property <string> label;
     in property <string> value;
     in property <color> value-color: Palette.foreground;
     spacing: 2px;
+    alignment: center;
     Text { text: root.label; color: Palette.foreground.transparentize(0.4); font-size: 10px; }
     Text { text: root.value; color: root.value-color; font-size: 15px; font-weight: 600; }
 }
@@ -207,129 +231,106 @@ export component AppWindow inherits Window {
 
             Rectangle {
                 vertical-stretch: 1;
+                // Room kept under the video for the controls.
+                property <length> under: 54px;
                 // The video box: as big as fits while keeping the video's shape, so
                 // the picture always fills it and there are no bars on resize.
                 video-box := Rectangle {
-                    width: min(parent.width, (parent.height - 44px) * root.preview-aspect);
+                    width: min(parent.width, (parent.height - parent.under) * root.preview-aspect);
                     height: self.width / root.preview-aspect;
                     x: (parent.width - self.width) / 2;
-                    y: (parent.height - 44px - self.height) / 2;
+                    y: (parent.height - parent.under - self.height) / 2;
                     background: #000000;
                     border-radius: 8px;
                     clip: true;
 
-                if root.has-preview: Image {
-                    width: parent.width;
-                    height: parent.height;
-                    source: root.preview;
-                    image-fit: fill;
-                }
-                if !root.has-preview: Text {
-                    text: root.preview-message;
-                    color: #8a93a3;
-                    font-size: 14px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+                    if root.has-preview: Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: root.preview;
+                        image-fit: fill;
+                    }
+                    if !root.has-preview: Text {
+                        text: root.preview-message;
+                        color: #8a93a3;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
 
-                // Recording badge.
-                if root.recording: Rectangle {
-                    x: 14px;
-                    y: 14px;
-                    width: badge.preferred-width + 24px;
-                    height: 28px;
-                    border-radius: 14px;
-                    background: #000000b0;
-                    badge := HorizontalLayout {
-                        padding-left: 12px;
-                        spacing: 8px;
-                        alignment: start;
-                        Rectangle {
-                            width: 10px;
-                            height: 10px;
-                            y: (parent.height - self.height) / 2;
-                            border-radius: 5px;
-                            background: #ff4d4f;
-                        }
-                        Text {
-                            text: "REC  " + root.time-text + "   ·   " + root.size-text + "   ·   " + root.bitrate-text;
-                            color: #ffffff;
-                            font-size: 13px;
-                            font-weight: 600;
-                            vertical-alignment: center;
+                    // Recording badge.
+                    if root.recording: Rectangle {
+                        x: 14px;
+                        y: 14px;
+                        width: badge.preferred-width + 24px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: #000000b0;
+                        badge := HorizontalLayout {
+                            padding-left: 12px;
+                            spacing: 8px;
+                            alignment: start;
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 5px;
+                                background: #ff4d4f;
+                            }
+                            Text {
+                                text: "REC  " + root.time-text + "   ·   " + root.size-text + "   ·   " + root.bitrate-text;
+                                color: #ffffff;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
                         }
                     }
+
                 }
-                }
-                // Quick controls under the preview. These work while recording too.
+
+                // Right under the video: mutes, live stats, Record.
                 HorizontalLayout {
                     x: video-box.x;
                     y: video-box.y + video-box.height + 10px;
                     width: video-box.width;
-                    height: 32px;
-                    spacing: 8px;
-                    alignment: start;
-                    if root.game-audio: MuteButton {
-                        icon: root.listen-muted ? @image-url("icons/speaker-off.svg") : @image-url("icons/speaker.svg");
-                        text: "Audio";
-                        muted: root.listen-muted;
-                        clicked => {
-                            root.listen-muted = !root.listen-muted;
-                            root.audio-levels-changed();
+                    height: 44px;
+                    // Tighter on small windows so the row stays as wide as the video.
+                    spacing: video-box.width < 1000px ? 12px : 22px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        if root.game-audio: MuteButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: root.listen-muted ? @image-url("icons/speaker-off.svg") : @image-url("icons/speaker.svg");
+                            text: "Audio";
+                            muted: root.listen-muted;
+                            clicked => { root.listen-muted = !root.listen-muted; root.audio-levels-changed(); }
+                        }
+                        if root.mic-index > 0: MuteButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: root.mic-muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
+                            text: "Mic";
+                            muted: root.mic-muted;
+                            clicked => { root.mic-muted = !root.mic-muted; root.audio-levels-changed(); }
                         }
                     }
-                    if root.mic-index > 0: MuteButton {
-                        icon: root.mic-muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
-                        text: "Mic";
-                        muted: root.mic-muted;
-                        clicked => {
-                            root.mic-muted = !root.mic-muted;
-                            root.audio-levels-changed();
-                        }
-                    }
-                }
-            }
-
-            // Live stats.
-            HorizontalLayout {
-                spacing: 28px;
-                padding-left: 4px;
-                Stat { label: "FRAME RATE"; value: root.fps-text; }
-                Stat {
-                    label: "LOST FRAMES";
-                    value: root.lost-text;
-                    value-color: root.lost-warning ? #e09000 : Palette.foreground;
-                }
-                Stat { label: "RECORDED"; value: root.recording ? root.time-text : "–"; }
-                Stat { label: "FILE SIZE"; value: root.size-text; }
-                Stat { label: "BITRATE"; value: root.recording ? root.bitrate-text : "–"; }
-                Stat { label: "DRIVE"; value: root.drive-text; }
-                Rectangle { horizontal-stretch: 1; }
-
-                HorizontalLayout {
-                    spacing: 10px;
-                    alignment: end;
-                    // Record / Stop.
-                    Rectangle {
+                    Stat { label: "FRAME RATE"; value: root.fps-text; }
+                    Stat { label: "LOST FRAMES"; value: root.lost-text; value-color: root.lost-warning ? #e09000 : Palette.foreground; }
+                    Stat { label: "FILE SIZE"; value: root.size-text; }
+                    Stat { label: "BITRATE"; value: root.recording ? root.bitrate-text : "–"; }
+                    Stat { label: "DISK SPACE LEFT"; value: root.drive-text; }
+                    Rectangle { horizontal-stretch: 1; }
+                    RecordButton {
                         y: (parent.height - self.height) / 2;
-                        width: max(170px, rec-text.preferred-width + 40px);
-                        height: 44px;
-                        border-radius: 8px;
-                        background: root.busy ? #6b7280
-                            : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
-                            : (touch.has-hover ? #e04548 : #d23a3d);
-                        rec-text := Text {
-                            text: root.busy ? root.finish-text : root.recording ? "Stop recording" : "Record";
-                            color: #ffffff;
-                            font-size: 16px;
-                            font-weight: 700;
-                        }
-                        touch := TouchArea {
-                            enabled: !root.busy;
-                            clicked => { root.record-clicked(); }
-                        }
+                        width: 160px;
+                        busy: root.busy;
+                        recording: root.recording;
+                        text: root.busy ? root.finish-text : root.recording ? "Stop recording" : "Record";
+                        clicked => { root.record-clicked(); }
                     }
                 }
+
             }
 
             if root.message != "": Rectangle {
@@ -352,18 +353,28 @@ export component AppWindow inherits Window {
 
         // ---- Settings drawer ------------------------------------------------------
         // Slides in from the right over the preview. Click outside it to close.
-        if root.settings-open: TouchArea {
-            clicked => { root.toggle-settings(); }
-            Rectangle { background: #00000050; }
+        // The dimmed backdrop fades in and out with the drawer.
+        Rectangle {
+            background: #00000060;
+            opacity: root.settings-open ? 1 : 0;
+            visible: self.opacity > 0;
+            animate opacity { duration: 300ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
+            TouchArea {
+                enabled: root.settings-open;
+                clicked => { root.toggle-settings(); }
+            }
         }
         Rectangle {
             x: root.settings-open ? parent.width - self.width : parent.width;
             y: 0;
             width: 400px;
             height: parent.height;
-            animate x { duration: 220ms; easing: ease-out; }
+            // Material-style "standard" curve: eases in and out, so the slide reads as
+            // motion instead of a jump.
+            animate x { duration: 300ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
             background: Palette.alternate-background;
-            drop-shadow-blur: root.settings-open ? 24px : 0px;
+            drop-shadow-blur: 24px;
+            visible: self.x < parent.width;
             drop-shadow-color: #00000070;
             // Swallow clicks so they don't reach the preview underneath.
             TouchArea { }

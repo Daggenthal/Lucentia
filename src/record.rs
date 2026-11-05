@@ -1125,12 +1125,25 @@ fn test_mode(o: &preview::Options) -> Mode {
 }
 
 fn test_video(mode: &Mode, hdr: bool) -> Result<(Vec<gst::Element>, gst::Element), String> {
-    let src = make("videotestsrc")?;
-    src.set_property("is-live", true);
-    src.set_property_from_str("pattern", "ball");
     let caps = make("capsfilter")?;
     caps.set_property("caps", preview::mode_caps(mode));
-    let mut chain = vec![src, caps.clone()];
+    let src = make("videotestsrc")?;
+    src.set_property("is-live", true);
+    let mut chain = vec![src.clone(), caps.clone()];
+    match std::env::var("LUCENTIA_TEST_IMAGE") {
+        // LUCENTIA_TEST_IMAGE=shot.png shows a still picture over the test pattern
+        // (for UI screenshots that look like real use).
+        Ok(path) => {
+            src.set_property_from_str("pattern", "black");
+            let overlay = make("gdkpixbufoverlay")?;
+            overlay.set_property("location", path);
+            overlay.set_property("overlay-width", mode.width);
+            overlay.set_property("overlay-height", mode.height);
+            chain.push(overlay);
+        }
+        Err(_) => src.set_property_from_str("pattern", "ball"),
+    }
+
     if hdr {
         let tag = make("capssetter")?;
         tag.set_property(
