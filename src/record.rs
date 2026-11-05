@@ -346,19 +346,8 @@ pub struct Session {
     /// Recordings whose files are complete (their end of stream reached the file).
     finished_bins: Arc<(Mutex<Vec<String>>, std::sync::Condvar)>,
     next_recording: AtomicU64,
-    /// The virtual camera output, when on: its bin and the tee pad feeding it.
-    virtual_camera: Mutex<Option<(gst::Bin, gst::Pad)>>,
     /// Latest audio peaks in dB (f32 bits), game then mic, for the level meters.
     levels: Arc<[AtomicU32; 2]>,
-}
-
-/// Where the clean video feed goes, for OBS, Discord and browsers.
-#[derive(Clone, Debug, PartialEq)]
-pub enum VirtualCamera {
-    /// A PipeWire camera node ("Lucentia"), no kernel module needed.
-    PipeWire,
-    /// A v4l2loopback device such as /dev/video10, which every camera app can open.
-    Loopback(PathBuf),
 }
 
 /// What the level meters show when there's no sound (or no source).
@@ -523,50 +512,11 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
         recording: Mutex::new(None),
         finished_bins: Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new())),
         next_recording: AtomicU64::new(1),
-        virtual_camera: Mutex::new(None),
         levels: Arc::new([
             AtomicU32::new(SILENT_DB.to_bits()),
             AtomicU32::new(SILENT_DB.to_bits()),
         ]),
     })
-}
-
-/// Loads v4l2loopback the way Chromium-based apps (Discord) need it.
-pub const LOOPBACK_COMMAND: &str =
-    "sudo modprobe v4l2loopback video_nr=10 card_label=Lucentia exclusive_caps=1";
-
-/// Whether the v4l2loopback module exists for the running kernel.
-pub fn loopback_module_available() -> bool {
-    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
-        return false;
-    };
-    let dir = std::path::Path::new("/lib/modules").join(release.trim());
-    ["modules.dep", "modules.builtin"].iter().any(|f| {
-        std::fs::read_to_string(dir.join(f)).is_ok_and(|t| t.contains("v4l2loopback"))
-    })
-}
-
-/// v4l2loopback devices on this machine (virtual video devices, not real cameras).
-pub fn loopback_devices() -> Vec<(PathBuf, String)> {
-    let Ok(dir) = std::fs::read_dir("/sys/class/video4linux") else {
-        return Vec::new();
-    };
-    let mut found: Vec<(PathBuf, String)> = dir
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            // Loopback devices are virtual: they live under /sys/devices/virtual.
-            std::fs::canonicalize(e.path())
-                .is_ok_and(|p| p.to_string_lossy().contains("/devices/virtual/"))
-        })
-        .map(|e| {
-            let name = std::fs::read_to_string(e.path().join("name"))
-                .map(|n| n.trim().to_string())
-                .unwrap_or_default();
-            (PathBuf::from("/dev").join(e.file_name()), name)
-        })
-        .collect();
-    found.sort();
-    found
 }
 
 impl Session {
@@ -794,118 +744,6 @@ impl Session {
             tee.release_request_pad(tee_pad);
         }
         done
-    }
-
-    /// Turn the virtual camera on (or switch it), or off with None. Like a
-    /// recording, it attaches to the running capture without reopening the card.
-    pub fn set_virtual_camera(&self, target: Option<VirtualCamera>) -> Result<(), String> {
-        let mut current = self.virtual_camera.lock().unwrap();
-        if let Some((bin, tee_pad)) = current.take() {
-            let ghost = bin.static_pad("sink");
-            let (bin2, pipeline, tee) = (bin.clone(), self.pipeline.clone(), self.video_tee.clone());
-            tee_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
-                if let Some(g) = &ghost {
-                    let _ = pad.unlink(g);
-                }
-                let (bin, pipeline, tee, pad) = (bin2.clone(), pipeline.clone(), tee.clone(), pad.clone());
-                // Tear down off the streaming thread.
-                std::thread::spawn(move || {
-                    let _ = bin.set_state(gst::State::Null);
-                    let _ = pipeline.remove(&bin);
-                    tee.release_request_pad(&pad);
-                });
-                gst::PadProbeReturn::Remove
-            });
-            log::debug("virtual camera off");
-        }
-        let Some(target) = target else {
-            return Ok(());
-        };
-
-        let bin = gst::Bin::with_name("virtual-camera");
-        // Leaky: if a viewer stalls, drop frames for it instead of holding up the
-        // preview and recording.
-        let q = make("queue")?;
-        q.set_property_from_str("leaky", "downstream");
-        q.set_property("max-size-buffers", 3u32);
-        q.set_property("max-size-bytes", 0u32);
-        q.set_property("max-size-time", 0u64);
-        let convert = make("videoconvert")?;
-        let scale = make("videoscale")?;
-        let caps = make("capsfilter")?;
-        // At most 1080p: what Discord and browsers handle well, and light to convert.
-        let mode = &self.plan.mode;
-        let (w, h) = if mode.width > 1920 {
-            (1920, (1920 * mode.height / mode.width.max(1)) & !1)
-        } else {
-            (mode.width, mode.height)
-        };
-        let format = match target {
-            // v4l2loopback readers (Chromium, Discord) like YUY2 best.
-            VirtualCamera::Loopback(_) => "YUY2",
-            VirtualCamera::PipeWire => "NV12",
-        };
-        caps.set_property(
-            "caps",
-            gst::Caps::builder("video/x-raw")
-                .field("format", format)
-                .field("width", w)
-                .field("height", h)
-                .build(),
-        );
-        let sink = match &target {
-            VirtualCamera::PipeWire => {
-                let s = make("pipewiresink")?;
-                if s.find_property("mode").is_some() {
-                    s.set_property_from_str("mode", "provide");
-                }
-                s.set_property("client-name", "Lucentia");
-                s.set_property(
-                    "stream-properties",
-                    gst::Structure::builder("props")
-                        .field("media.class", "Video/Source")
-                        .field("media.role", "Camera")
-                        .field("node.name", "lucentia")
-                        .field("node.description", "Lucentia (capture card)")
-                        .build(),
-                );
-                s
-            }
-            VirtualCamera::Loopback(dev) => {
-                let s = make("v4l2sink")?;
-                s.set_property("device", dev.to_string_lossy().to_string());
-                s
-            }
-        };
-        sink.set_property("sync", false);
-        sink.set_property("async", false);
-        let chain = [q.clone(), convert, scale, caps, sink];
-        bin.add_many(&chain).map_err(|e| e.to_string())?;
-        gst::Element::link_many(&chain).map_err(|_| "could not build the virtual camera")?;
-        let ghost = gst::GhostPad::builder_with_target(&q.static_pad("sink").unwrap())
-            .map_err(|e| e.to_string())?
-            .name("sink")
-            .build();
-        bin.add_pad(&ghost).map_err(|e| e.to_string())?;
-        self.pipeline.add(&bin).map_err(|e| e.to_string())?;
-        if bin.sync_state_with_parent().is_err() {
-            let _ = bin.set_state(gst::State::Null);
-            let _ = self.pipeline.remove(&bin);
-            return Err(match target {
-                VirtualCamera::PipeWire => "could not create the PipeWire camera. Is PipeWire running?".into(),
-                VirtualCamera::Loopback(d) => format!("could not open {} (v4l2loopback)", d.display()),
-            });
-        }
-        let tee_pad = self
-            .video_tee
-            .request_pad_simple("src_%u")
-            .ok_or("the capture refused another output")?;
-        tee_pad
-            .link(&ghost)
-            .map_err(|e| format!("could not attach the virtual camera: {e:?}"))?;
-        log::debug(&format!("virtual camera on: {target:?} at {w}x{h} {format}"));
-        *current = Some((bin, tee_pad));
-        Ok(())
     }
 
     /// Change the size of the frames sent to the window (bigger for the pop-out

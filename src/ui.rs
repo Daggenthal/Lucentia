@@ -77,8 +77,7 @@ struct State {
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Frame rate to pick next time the list is filled (restoring saved settings).
     wanted_rate: Option<f64>,
-    /// Virtual camera menu entries (None = Off).
-    cameras: Vec<Option<record::VirtualCamera>>,
+
 }
 
 pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
@@ -134,9 +133,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         auto_restarts: Vec::new(),
         workers: Vec::new(),
         wanted_rate: None,
-        cameras: Vec::new(),
     }));
-    fill_cameras(&ui, &state);
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
@@ -287,14 +284,6 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             if !ui.get_recording() {
                 restart(&ui, &s);
             }
-            remember(&ui, &s.borrow());
-        });
-    }
-    {
-        let (w, s) = (ui.as_weak(), state.clone());
-        ui.on_virtual_camera_changed(move || {
-            let ui = w.unwrap();
-            apply_camera(&ui, &s.borrow());
             remember(&ui, &s.borrow());
         });
     }
@@ -592,76 +581,6 @@ fn close_popout(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     }
 }
 
-/// Fill the virtual camera menu: Off, the PipeWire camera, and any v4l2loopback
-/// devices found.
-fn fill_cameras(ui: &AppWindow, state: &Rc<RefCell<State>>) {
-    let mut labels: Vec<SharedString> = vec!["Off".into(), "PipeWire camera".into()];
-    let mut cams = vec![None, Some(record::VirtualCamera::PipeWire)];
-    for (dev, name) in record::loopback_devices() {
-        labels.push(format!("{} ({name})", dev.display()).into());
-        cams.push(Some(record::VirtualCamera::Loopback(dev)));
-    }
-    ui.set_virtual_cameras(strings(labels));
-    state.borrow_mut().cameras = cams;
-}
-
-/// Turn the virtual camera on, off or over to another target, and explain it.
-fn apply_camera(ui: &AppWindow, s: &State) {
-    let target = s
-        .cameras
-        .get(ui.get_virtual_camera_index().max(0) as usize)
-        .cloned()
-        .flatten();
-    let has_loopback = s.cameras.len() > 2;
-    let note = match &target {
-        None => {
-            "Sends just the video (no Lucentia window) to OBS, Discord or a browser as a \
-             camera. Audio: add the card's audio in OBS or Discord directly."
-                .to_string()
-        }
-        Some(record::VirtualCamera::PipeWire) => {
-            let mut n = "Shows up as \"Lucentia (capture card)\" in apps that use PipeWire \
-                 cameras: OBS (Video Capture Device (PipeWire)) and browsers."
-                .to_string();
-            if !has_loopback {
-                if record::loopback_module_available() {
-                    n.push_str(
-                        " Discord's app only sees regular cameras: for it, run this \
-                         command, then restart Lucentia.",
-                    );
-                } else {
-                    n.push_str(
-                        " Discord's app only sees regular cameras, which needs the \
-                         v4l2loopback kernel module, and it isn't installed for this kernel. \
-                         On Arch: sudo pacman -S v4l2loopback-dkms linux-headers. On \
-                         SteamOS it isn't included; use OBS with this camera, or share the \
-                         Lucentia window in Discord.",
-                    );
-                }
-            }
-            n
-        }
-        Some(record::VirtualCamera::Loopback(d)) => format!(
-            "Every camera app (Discord, OBS, browsers) can pick {}. Higher than 1080p is \
-             scaled down to 1080p.",
-            d.display()
-        ),
-    };
-    ui.set_virtual_camera_note(note.into());
-    // The exact command, with a Copy button, so nobody has to type it.
-    let show_command = matches!(target, Some(record::VirtualCamera::PipeWire))
-        && !has_loopback
-        && record::loopback_module_available();
-    ui.set_loopback_command(
-        if show_command { record::LOOPBACK_COMMAND } else { "" }.into(),
-    );
-    if let Some(r) = &s.running {
-        if let Err(e) = r.session.set_virtual_camera(target) {
-            show(ui, &e, true);
-        }
-    }
-}
-
 /// Order of the Codec menu.
 const CODECS: [Codec; 4] = [Codec::Hevc, Codec::Av1, Codec::H264, Codec::Raw];
 
@@ -912,7 +831,6 @@ fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         session: session.clone(),
         generation,
     });
-    apply_camera(ui, &state.borrow());
     if POPOUT.with(|p| p.borrow().is_some()) {
         session.set_preview_width(1920);
     }
@@ -1466,16 +1384,6 @@ fn restore_settings(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     if let Some(v) = int("format") {
         ui.set_format_index(v.clamp(0, 1));
     }
-    if let Some(cam) = get("virtual_camera") {
-        let i = state.borrow().cameras.iter().position(|c| match c {
-            None => cam == "off",
-            Some(record::VirtualCamera::PipeWire) => cam == "pipewire",
-            Some(record::VirtualCamera::Loopback(d)) => d.display().to_string() == cam,
-        });
-        if let Some(i) = i {
-            ui.set_virtual_camera_index(i as i32);
-        }
-    }
     if let Some(dir) = get("output_dir").map(PathBuf::from) {
         ui.set_output_folder(dir.display().to_string().into());
         state.borrow_mut().output_dir = dir;
@@ -1507,16 +1415,8 @@ fn remember(ui: &AppWindow, s: &State) {
         ("echo_cancel", Some(b(ui.get_echo_cancel()))),
         ("format", Some(ui.get_format_index().to_string())),
         ("output_dir", Some(s.output_dir.display().to_string())),
-        (
-            "virtual_camera",
-            Some(
-                match s.cameras.get(ui.get_virtual_camera_index().max(0) as usize).cloned().flatten() {
-                    None => "off".to_string(),
-                    Some(record::VirtualCamera::PipeWire) => "pipewire".to_string(),
-                    Some(record::VirtualCamera::Loopback(d)) => d.display().to_string(),
-                },
-            ),
-        ),
+        // Drop the old virtual camera setting from earlier versions.
+        ("virtual_camera", None),
         // Only a bitrate the user picked; otherwise each mode gets its own default.
         (
             "bitrate",

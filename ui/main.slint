@@ -211,14 +211,6 @@ export component AppWindow inherits Window {
     callback record-clicked();
     callback choose-folder();
     callback open-folder();
-    // Virtual camera: where the clean video goes (Off, PipeWire, v4l2loopback devices).
-    in property <[string]> virtual-cameras: ["Off"];
-    in-out property <int> virtual-camera-index: 0;
-    in property <string> virtual-camera-note;
-    // The v4l2loopback command to copy, when it's needed.
-    in property <string> loopback-command;
-    in-out property <bool> command-copied: false;
-    callback virtual-camera-changed();
     // The settings panel was shown or hidden (to remember it).
     callback settings-toggled();
     in-out property <bool> settings-open: false;
@@ -661,52 +653,6 @@ export component AppWindow inherits Window {
                                     text: "Add a Game + Mic track (plays by default)";
                                     checked <=> root.mix-track;
                                     toggled => { root.settings-changed(); }
-                                }
-                            }
-                        }
-
-                        GroupBox {
-                            title: "Virtual camera (OBS, Discord)";
-                            VerticalLayout {
-                                spacing: 8px;
-                                Row {
-                                    Label { text: "Camera"; width: 90px; }
-                                    ComboBox {
-                                        model: root.virtual-cameras;
-                                        current-index <=> root.virtual-camera-index;
-                                        selected => { root.virtual-camera-changed(); }
-                                    }
-                                }
-                                Hint { text: root.virtual-camera-note; }
-                                if root.loopback-command != "": HorizontalLayout {
-                                    spacing: 8px;
-                                    Rectangle {
-                                        horizontal-stretch: 1;
-                                        height: 32px;
-                                        border-radius: 6px;
-                                        background: Palette.foreground.transparentize(0.92);
-                                        clip: true;
-                                        command := TextInput {
-                                            x: 8px;
-                                            width: parent.width - 16px;
-                                            text: root.loopback-command;
-                                            read-only: true;
-                                            single-line: true;
-                                            font-family: "monospace";
-                                            font-size: 11px;
-                                            color: Palette.foreground;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                    Button {
-                                        text: root.command-copied ? "Copied" : "Copy";
-                                        clicked => {
-                                            command.select-all();
-                                            command.copy();
-                                            command.clear-selection();
-                                            root.command-copied = true;
-                                        }
-                                    }
                                 }
                             }
                         }

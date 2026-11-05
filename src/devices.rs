@@ -134,9 +134,8 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
 
         let path = get(&["api.v4l2.path", "device.path", "object.path"]);
 
-        // Skip virtual cameras: v4l2loopback devices and Lucentia's own PipeWire
-        // camera are outputs, not capture cards.
-        if get(&["node.name"]).as_deref() == Some("lucentia") || is_virtual_video(path.as_deref()) {
+        // Skip virtual cameras (v4l2loopback and the like): they aren't capture cards.
+        if is_virtual_video(path.as_deref()) {
             log::debug(&format!("  skipping virtual device {}", dev.display_name()));
             continue;
         }

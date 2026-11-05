@@ -17,7 +17,7 @@ Early days. Right now Lucentia can:
 - Estimate file size before you start, and show size, bitrate, lost frames and time left on the drive while recording
 - Level meters for game audio and the mic, and mute buttons for both
 - Echo cancellation for the mic: removes the game sound your mic picks up from speakers
-- Send just the gameplay to OBS, Discord or a browser as a camera (PipeWire camera or v4l2loopback)
+- Share just the gameplay in Discord (or on another screen) with a video-only window
 - A record hotkey (Alt+F9 by default, through your desktop's global shortcuts) and a `lucentia toggle-record` command
 - Check that your GPU can encode each codec, and say why not (GPU and driver) when it can't
 - Remember your settings between launches
@@ -62,8 +62,6 @@ cargo run --release
 Run `cargo run --release` to open the app. Open Settings (top right) to pick your card, resolution and frame rate (10-bit HDR shows up when the card offers it) and set the codec and bitrate, then press Record. The Audio and Mic buttons under the video mute your speakers or your mic, even mid-recording. The size estimate updates as you change settings. For 40 fps games (like 40 Hz modes on handhelds), pick "40 fps (from 120 Hz)": Lucentia captures at 120 Hz and keeps every third frame, so set the source to output 120 Hz. On the command line that's `--mode 1920x1080@120 --record-fps 40`. When a recording finishes, Lucentia asks where to save it and what to call it (you can turn that off under Output).
 
 **Sharing the gameplay in Discord.** Press **Share** (next to Record). It opens a window with only the video, at up to 1080p. In Discord, pick that window under Share Screen. Double-click it for full screen.
-
-**Virtual camera.** Under Settings, Virtual camera, pick one. "PipeWire camera" needs no setup and shows up in OBS as "Lucentia (capture card)". For Discord and other apps that only see regular cameras, load v4l2loopback (`sudo modprobe v4l2loopback video_nr=10 card_label=Lucentia exclusive_caps=1`), restart Lucentia and pick the new device. For sound, add the card's audio in OBS or Discord directly.
 
 **Hotkey.** Lucentia asks your desktop for Alt+F9 to start and stop recording (KDE, GNOME and others let you confirm or change it). Where that isn't available, bind `lucentia toggle-record` to a key in your desktop's keyboard settings or in Steam Input.
 
