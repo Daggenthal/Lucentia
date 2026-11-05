@@ -3,26 +3,59 @@
 //! Commands:
 //!   lucentia                 list capture devices and their modes
 //!   lucentia preview [opts]  live preview with sound
+//!   lucentia record [opts]   record to a file
+//!   lucentia mics            list microphones
 //! Add --debug (or LUCENTIA_DEBUG=1) to see everything GStreamer reports.
 
 mod devices;
+mod encode;
+mod estimate;
 mod log;
 mod preview;
+mod record;
+mod remux;
 
 use devices::{Kind, Mode};
+use encode::{AudioCodec, Codec, RateControl};
+use gst::prelude::*;
 use gstreamer as gst;
+use std::path::PathBuf;
 
 const USAGE: &str = "\
 Usage:
   lucentia                      List capture devices and the modes they support
   lucentia preview [options]    Live preview with sound
+  lucentia record [options]     Record to a file (Ctrl+C to stop)
+  lucentia mics                 List microphones
 
-Preview options:
+Capture options (preview and record):
   --mode WxH@FPS   Mode to open, e.g. 1920x1080@60 or 3840x2160@59.94 (default 1080p60)
   --hdr            Use the 10-bit HDR version of the mode
   --mjpeg          Use the card's MJPEG version of the mode (needed for 4K144)
-  --no-audio       Picture only
+  --hdr-signal     The source is sending HDR in an 8-bit mode (e.g. 4K60 HDR)
+  --no-audio       No game audio
   --device N       Which card to use when more than one is connected (default 1)
+
+Record options:
+  --codec C        h264, hevc, av1 or raw (default: hevc, or av1 for HDR)
+  --cbr MBPS       Fixed bitrate in Mbit/s (default: 40 at 1080p60, scaled by mode)
+  --vbr MBPS[:MAX] Variable bitrate: average, and optional ceiling (default 1.5x)
+  --quality Q      Constant quality, 0 (best) to 51 (worst); about 18 to 23 is good
+  --keyframe SECS  Seconds between keyframes (default 2)
+  --analysis       Every frame a keyframe, for frame-accurate analysis (big files)
+  --audio C        aac, opus or pcm (default aac)
+  --audio-bitrate K  Audio bitrate in kbit/s (default 320)
+  --mic NAME       Also record a mic as its own track (part of its name, or default)
+  --mic-offset MS  Shift the mic in milliseconds to line it up with the video
+  --mix-track      Add a third track with game and mic mixed together
+  --format F       mkv (default) or mp4. MKV is recommended: if the app, the system
+                   or the power cuts out mid-recording, everything up to that moment
+                   is still playable, and players show the track names (Game, Mic).
+                   MP4 is recorded as MKV for the same safety, then converted when you
+                   stop, for editors or sites that only take MP4.
+  --output PATH    Where to save (default ~/Videos/Lucentia/Lucentia <date>.mkv)
+  --duration SECS  Stop by itself after this long
+  --preview        Show a preview window while recording
 
 Global options:
   --debug, -d      Full logging
@@ -56,6 +89,20 @@ fn main() {
     }
     log::debug(&format!("GStreamer {}", gst::version_string()));
 
+    let cmd = args
+        .first()
+        .map(String::as_str)
+        .filter(|c| !c.starts_with('-'));
+    match cmd {
+        Some("mics") => return list_mics(),
+        Some("preview") | Some("record") | None => {}
+        Some(other) => {
+            log::error(&format!("unknown command `{other}`\n\n{USAGE}"));
+            std::process::exit(64);
+        }
+    }
+
+    let test_source = args.iter().any(|a| a == "--test-source");
     let devs = match devices::list() {
         Ok(d) => d,
         Err(e) => {
@@ -63,19 +110,21 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if devs.is_empty() {
+    if devs.is_empty() && !test_source {
         log::warn("no capture devices found. Is the card plugged in?");
         std::process::exit(2);
     }
 
-    match args.first().map(String::as_str) {
+    match cmd {
         Some("preview") => run_preview(&args[1..], &devs),
-        Some(cmd) if !cmd.starts_with('-') => {
-            log::error(&format!("unknown command `{cmd}`\n\n{USAGE}"));
-            std::process::exit(64);
-        }
+        Some("record") => run_record(&args[1..], &devs),
         _ => list(&devs),
     }
+}
+
+fn fail(msg: &str) -> ! {
+    log::error(msg);
+    std::process::exit(64);
 }
 
 fn list(devs: &[devices::CaptureDevice]) {
@@ -90,52 +139,234 @@ fn list(devs: &[devices::CaptureDevice]) {
     }
 }
 
-fn run_preview(args: &[String], devs: &[devices::CaptureDevice]) {
-    let fail = |msg: &str| -> ! {
-        log::error(msg);
-        std::process::exit(64);
-    };
-    let mut opts = preview::Options {
+fn list_mics() {
+    let mics = devices::list_mics();
+    if mics.is_empty() {
+        log::warn("no microphones found");
+        return;
+    }
+    println!(
+        "{}",
+        log::bold("Microphones (use part of the name with --mic):")
+    );
+    for d in mics {
+        let default = d
+            .properties()
+            .and_then(|p| p.get::<bool>("is-default").ok())
+            .unwrap_or(false);
+        let tag = if default {
+            log::green("  [default]")
+        } else {
+            String::new()
+        };
+        println!("  {}{tag}", d.display_name());
+    }
+}
+
+fn default_capture() -> preview::Options {
+    preview::Options {
         mode: None,
         hdr: false,
         mjpeg: false,
+        hdr_signal: false,
         audio: true,
-    };
+    }
+}
+
+fn next_value<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str, hint: &str) -> &'a str {
+    it.next()
+        .map(String::as_str)
+        .unwrap_or_else(|| fail(&format!("{flag} needs a value, e.g. {hint}")))
+}
+
+fn parse_num<T: std::str::FromStr>(v: &str, flag: &str) -> T {
+    v.parse()
+        .unwrap_or_else(|_| fail(&format!("{flag}: `{v}` isn't a valid number")))
+}
+
+/// Options shared by preview and record. Returns false if `a` isn't one of them.
+fn capture_flag(
+    a: &str,
+    it: &mut std::slice::Iter<'_, String>,
+    opts: &mut preview::Options,
+    index: &mut usize,
+) -> bool {
+    match a {
+        "--mode" => {
+            let v = next_value(it, "--mode", "1920x1080@60");
+            opts.mode =
+                Some(preview::parse_mode(v).unwrap_or_else(|| {
+                    fail(&format!("can't read mode `{v}`; use e.g. 1920x1080@60"))
+                }));
+        }
+        "--hdr" => opts.hdr = true,
+        "--mjpeg" => opts.mjpeg = true,
+        "--hdr-signal" => opts.hdr_signal = true,
+        "--no-audio" => opts.audio = false,
+        "--device" => {
+            *index = parse_num(next_value(it, "--device", "1"), "--device");
+            if *index == 0 {
+                fail("--device starts at 1");
+            }
+        }
+        "--debug" | "-d" => {}
+        _ => return false,
+    }
+    true
+}
+
+fn pick_card<'a>(devs: &'a [devices::CaptureDevice], index: usize) -> &'a devices::CaptureDevice {
+    devs.get(index - 1)
+        .unwrap_or_else(|| fail(&format!("there is no device {index}; found {}", devs.len())))
+}
+
+fn run_preview(args: &[String], devs: &[devices::CaptureDevice]) {
+    let mut opts = default_capture();
     let mut index = 1usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--mode" => {
-                let v = it
-                    .next()
-                    .unwrap_or_else(|| fail("--mode needs a value like 1920x1080@60"));
-                opts.mode = Some(preview::parse_mode(v).unwrap_or_else(|| {
-                    fail(&format!("can't read mode `{v}`; use e.g. 1920x1080@60"))
-                }));
-            }
-            "--hdr" => opts.hdr = true,
-            "--mjpeg" => opts.mjpeg = true,
-            "--no-audio" => opts.audio = false,
-            "--device" => {
-                let v = it.next().unwrap_or_else(|| fail("--device needs a number"));
-                index = v
-                    .parse()
-                    .ok()
-                    .filter(|n| *n >= 1)
-                    .unwrap_or_else(|| fail("--device needs a number, starting at 1"));
-            }
-            "--debug" | "-d" => {}
-            other => fail(&format!("unknown preview option `{other}`\n\n{USAGE}")),
+        if !capture_flag(a, &mut it, &mut opts, &mut index) {
+            fail(&format!("unknown preview option `{a}`\n\n{USAGE}"));
         }
     }
     if opts.hdr && opts.mjpeg {
         fail("--hdr and --mjpeg can't be combined: the card's MJPEG modes are 8-bit");
     }
-    let card = devs
-        .get(index - 1)
-        .unwrap_or_else(|| fail(&format!("there is no device {index}; found {}", devs.len())));
+    if let Err(e) = preview::run(pick_card(devs, index), &opts) {
+        log::error(&e);
+        std::process::exit(1);
+    }
+}
 
-    if let Err(e) = preview::run(card, &opts) {
+fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
+    let mut opts = record::Options {
+        capture: default_capture(),
+        codec: None,
+        rate: None,
+        keyframe_secs: 2.0,
+        analysis: false,
+        audio_codec: AudioCodec::Aac,
+        audio_kbps: 320,
+        mic: None,
+        mic_offset_ms: 0,
+        mix_track: false,
+        container: record::Container::Mkv,
+        output: None,
+        duration: None,
+        preview: false,
+        test_source: false,
+    };
+    let mut index = 1usize;
+    let mbps = |v: &str, flag: &str| -> u32 {
+        let m: f64 = parse_num(v, flag);
+        if !(0.1..=2000.0).contains(&m) {
+            fail(&format!("{flag}: {m} Mbit/s is out of range (0.1 to 2000)"));
+        }
+        (m * 1000.0).round() as u32
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if capture_flag(a, &mut it, &mut opts.capture, &mut index) {
+            continue;
+        }
+        match a.as_str() {
+            "--codec" => {
+                let v = next_value(&mut it, "--codec", "hevc");
+                opts.codec = Some(Codec::parse(v).unwrap_or_else(|| {
+                    fail(&format!("unknown codec `{v}` (h264, hevc, av1, raw)"))
+                }));
+            }
+            "--cbr" => {
+                opts.rate = Some(RateControl::Cbr {
+                    kbps: mbps(next_value(&mut it, "--cbr", "40"), "--cbr"),
+                })
+            }
+            "--vbr" => {
+                let v = next_value(&mut it, "--vbr", "40:60");
+                let (avg, max) = match v.split_once(':') {
+                    Some((a, m)) => (mbps(a, "--vbr"), mbps(m, "--vbr")),
+                    None => {
+                        let a = mbps(v, "--vbr");
+                        (a, a * 3 / 2)
+                    }
+                };
+                if max < avg {
+                    fail("--vbr: the ceiling has to be at least the average");
+                }
+                opts.rate = Some(RateControl::Vbr {
+                    kbps: avg,
+                    max_kbps: max,
+                });
+            }
+            "--quality" => {
+                let q: u32 = parse_num(next_value(&mut it, "--quality", "20"), "--quality");
+                if q > 51 {
+                    fail("--quality goes from 0 (best) to 51 (worst)");
+                }
+                opts.rate = Some(RateControl::Quality { q });
+            }
+            "--keyframe" => {
+                opts.keyframe_secs =
+                    parse_num(next_value(&mut it, "--keyframe", "2"), "--keyframe");
+                if opts.keyframe_secs <= 0.0 {
+                    fail("--keyframe has to be more than 0 seconds");
+                }
+            }
+            "--analysis" => opts.analysis = true,
+            "--audio" => {
+                let v = next_value(&mut it, "--audio", "aac");
+                opts.audio_codec = AudioCodec::parse(v).unwrap_or_else(|| {
+                    fail(&format!("unknown audio codec `{v}` (aac, opus, pcm)"))
+                });
+            }
+            "--audio-bitrate" => {
+                opts.audio_kbps = parse_num(
+                    next_value(&mut it, "--audio-bitrate", "320"),
+                    "--audio-bitrate",
+                )
+            }
+            "--mic" => opts.mic = Some(next_value(&mut it, "--mic", "Wave").to_string()),
+            "--mic-offset" => {
+                opts.mic_offset_ms =
+                    parse_num(next_value(&mut it, "--mic-offset", "40"), "--mic-offset")
+            }
+            "--mix-track" => opts.mix_track = true,
+            "--format" => {
+                opts.container = match next_value(&mut it, "--format", "mkv")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "mp4" => record::Container::Mp4,
+                    "mkv" => record::Container::Mkv,
+                    other => fail(&format!("unknown format `{other}` (mp4, mkv)")),
+                }
+            }
+            "--output" | "-o" => {
+                opts.output = Some(PathBuf::from(next_value(&mut it, "--output", "clip.mp4")))
+            }
+            "--duration" => {
+                opts.duration = Some(parse_num(
+                    next_value(&mut it, "--duration", "60"),
+                    "--duration",
+                ))
+            }
+            "--preview" => opts.preview = true,
+            "--test-source" => opts.test_source = true,
+            other => fail(&format!("unknown record option `{other}`\n\n{USAGE}")),
+        }
+    }
+    if opts.capture.hdr && opts.capture.mjpeg {
+        fail("--hdr and --mjpeg can't be combined: the card's MJPEG modes are 8-bit");
+    }
+    if opts.mix_track && opts.mic.is_none() {
+        log::warn("--mix-track needs --mic; recording without a mix track");
+    }
+    let card = if opts.test_source {
+        None
+    } else {
+        Some(pick_card(devs, index))
+    };
+    if let Err(e) = record::run(card, &opts) {
         log::error(&e);
         std::process::exit(1);
     }

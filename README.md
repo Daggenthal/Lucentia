@@ -8,14 +8,19 @@ Early days. Right now Lucentia can:
 
 - Find your capture card and list every mode it supports, marked as lossless (uncompressed) or MJPEG (compressed on the card), with 10-bit HDR modes flagged
 - Show a live preview with the card's audio, found automatically, and report the real frame rate
+- Tone map HDR in the preview so it doesn't look washed out
+- Record with H.264, HEVC, AV1 or raw video, at any bitrate, with CBR, VBR or constant quality
+- Record 10-bit HDR with correct HDR10 tags
+- Record your mic on its own track, with a sync offset and an optional mixed track
+- Estimate file size before you start, and show size, bitrate, lost frames and time left on the drive while recording
 
 Tested on: SteamOS with an Elgato 4K X.
 
 ## Planned
 
-- Pick any bitrate, codec (H.264, HEVC, AV1) and rate control mode
-- 10-bit HDR recording with correct HDR10 tags
-- Mic support: Separate game and mic tracks, level meters, live monitoring and a sync offset
+- A real app window with the preview and a settings panel
+- Mic level meters and live monitoring
+- Use Lucentia as a source in OBS for streaming
 - AppImage for any Linux distro, with Windows and macOS builds later
 
 ## Building
@@ -23,7 +28,8 @@ Tested on: SteamOS with an Elgato 4K X.
 Needs Rust and the GStreamer development packages. On Arch (or an Arch distrobox on SteamOS):
 
 ```
-sudo pacman -S rustup base-devel pkgconf gstreamer gst-plugins-base gst-plugins-good
+sudo pacman -S rustup base-devel pkgconf gstreamer gst-plugins-base gst-plugins-good \
+  gst-plugins-bad gst-plugin-va gst-plugin-pipewire gst-libav
 rustup default stable
 cargo run --release
 ```
@@ -38,6 +44,26 @@ cargo run --release -- preview --mode 2560x1440@60 --hdr
 cargo run --release -- preview --mode 3840x2160@144 --mjpeg
 cargo run --release -- --help                          # all options
 ```
+
+### Recording
+
+```
+cargo run --release -- record                                   # 1080p60, HEVC, 40 Mbit/s, game audio
+cargo run --release -- record --mode 2560x1440@60 --hdr         # 10-bit HDR (AV1 by default)
+cargo run --release -- record --codec av1 --quality 20          # constant quality instead of a bitrate
+cargo run --release -- record --mic Wave --mix-track            # mic on its own track, plus a mixed track
+cargo run --release -- record --analysis --cbr 150              # every frame a keyframe, for frame analysis
+cargo run --release -- record --preview --duration 600          # watch while recording, stop after 10 minutes
+cargo run --release -- mics                                     # list microphones for --mic
+```
+
+Press Ctrl+C to stop. Recordings go to `~/Videos/Lucentia` unless you pass `--output`.
+
+**MKV or MP4?** MKV is the default and the recommendation: if the app, the system or the power cuts out mid-recording, everything up to that moment is still playable, and players and editors show the track names (Game, Mic). Pass `--format mp4` if your editor or a site only takes MP4. It still records as MKV for the same safety, then converts to MP4 when you stop, without re-encoding.
+
+Rough sizes at a fixed bitrate: 20 Mbit/s is about 9 GB per hour, 40 Mbit/s about 18 GB, 80 Mbit/s about 36 GB. Lucentia prints the estimate for your settings before it starts.
+
+Known issue: 10-bit HEVC from the GPU encoder is labeled "Main" instead of "Main 10". It plays fine in most players; AV1 (the default for HDR) doesn't have this problem.
 
 Add `--debug` to any command to also print everything GStreamer reports.
 

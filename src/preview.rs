@@ -20,6 +20,8 @@ pub struct Options {
     pub hdr: bool,
     /// Use the card's MJPEG variant of the mode.
     pub mjpeg: bool,
+    /// The source sends HDR even though the mode is 8-bit (tone map the preview).
+    pub hdr_signal: bool,
     pub audio: bool,
 }
 
@@ -82,13 +84,13 @@ pub fn choose_mode(card: &CaptureDevice, opts: &Options) -> Result<Mode, String>
         .ok_or_else(|| format!("{} reported no usable modes", card.name))
 }
 
-fn make(factory: &str) -> Result<gst::Element, String> {
+pub(crate) fn make(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .build()
         .map_err(|_| format!("GStreamer element `{factory}` is missing. Is its plugin installed?"))
 }
 
-fn mode_caps(mode: &Mode) -> gst::Caps {
+pub(crate) fn mode_caps(mode: &Mode) -> gst::Caps {
     let name = match mode.kind {
         Kind::Lossless => "video/x-raw",
         Kind::Mjpeg => "image/jpeg",
@@ -103,7 +105,7 @@ fn mode_caps(mode: &Mode) -> gst::Caps {
     b.build()
 }
 
-fn video_source(card: &CaptureDevice) -> Result<gst::Element, String> {
+pub(crate) fn video_source(card: &CaptureDevice) -> Result<gst::Element, String> {
     // On Linux, open the card through V4L2 directly: PipeWire's camera path hides the
     // 10-bit modes.
     if cfg!(target_os = "linux") {
@@ -122,7 +124,7 @@ fn video_source(card: &CaptureDevice) -> Result<gst::Element, String> {
 ///
 /// On Linux we go through PipeWire's PulseAudio layer (pulsesrc) by node name. That's
 /// the path that played cleanly in our tests; pipewiresrc dropped out after a moment.
-fn audio_source(dev: &gst::Device) -> Result<gst::Element, String> {
+pub(crate) fn audio_source(dev: &gst::Device) -> Result<gst::Element, String> {
     if cfg!(target_os = "linux") {
         let name = dev.properties().and_then(|p| {
             ["node.name", "device.name"]
@@ -190,43 +192,24 @@ void main() {
 }
 "#;
 
-pub fn run(card: &CaptureDevice, opts: &Options) -> Result<(), String> {
-    let mode = choose_mode(card, opts)?;
-    let label = format!(
-        "{}x{}@{}{}",
-        mode.width,
-        mode.height,
-        fmt_fps(mode.fps()),
-        match (&mode.kind, mode.ten_bit()) {
-            (Kind::Mjpeg, _) => " MJPEG",
-            (_, true) => " 10-bit HDR",
-            _ => " lossless",
-        }
-    );
-    println!("{} {} at {label}", log::green("opening"), card.name);
+/// Whether frames should be treated as HDR (BT.2100 PQ): every 10-bit mode, or an
+/// 8-bit mode when the user says the source is sending HDR (4K60 HDR over 10 Gbps).
+pub(crate) fn is_hdr(mode: &Mode, hdr_signal: bool) -> bool {
+    mode.ten_bit() || hdr_signal
+}
 
-    let pipeline = gst::Pipeline::new();
-
-    // Video branch. Everything after the source runs on the GPU through OpenGL:
-    // converting 4K60 frames on the CPU is what made the first version lag.
+/// Card source -> exact mode -> [HDR tag] -> [MJPEG decode]. Returns the elements and
+/// the capsfilter, whose src pad sees every frame exactly as it left the card.
+pub(crate) fn capture_chain(
+    card: &CaptureDevice,
+    mode: &Mode,
+    hdr: bool,
+) -> Result<(Vec<gst::Element>, gst::Element), String> {
     let src = video_source(card)?;
     let caps = make("capsfilter")?;
-    caps.set_property("caps", mode_caps(&mode));
-    let mut chain = vec![src, caps.clone(), make("queue")?];
+    caps.set_property("caps", mode_caps(mode));
+    let mut chain = vec![src, caps.clone()];
 
-    let hdr = mode.kind == Kind::Lossless && mode.ten_bit();
-    if hdr {
-        // The card doesn't report its signal as HDR, so say so ourselves. This makes
-        // the color conversion below use the BT.2020 matrix.
-        let tag = make("capssetter")?;
-        tag.set_property(
-            "caps",
-            gst::Caps::builder("video/x-raw")
-                .field("colorimetry", "bt2100-pq")
-                .build(),
-        );
-        chain.push(tag);
-    }
     if mode.kind == Kind::Mjpeg {
         // Hardware JPEG decoding when available (AMD/Intel via VA-API).
         match make("vajpegdec") {
@@ -241,6 +224,24 @@ pub fn run(card: &CaptureDevice, opts: &Options) -> Result<(), String> {
             }
         }
     }
+    if hdr {
+        // The card doesn't report its signal as HDR, so say so ourselves. The GPU color
+        // conversion and the encoders read this tag.
+        let tag = make("capssetter")?;
+        tag.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("colorimetry", "bt2100-pq")
+                .build(),
+        );
+        chain.push(tag);
+    }
+    Ok((chain, caps))
+}
+
+/// GPU display: upload, convert, [tone map HDR], window. Falls back to the CPU.
+pub(crate) fn display_chain(hdr: bool) -> Result<Vec<gst::Element>, String> {
+    let mut chain = Vec::new();
     match (
         make("glupload"),
         make("glcolorconvert"),
@@ -268,6 +269,33 @@ pub fn run(card: &CaptureDevice, opts: &Options) -> Result<(), String> {
             chain.push(sink);
         }
     }
+    Ok(chain)
+}
+
+pub fn run(card: &CaptureDevice, opts: &Options) -> Result<(), String> {
+    let mode = choose_mode(card, opts)?;
+    let label = format!(
+        "{}x{}@{}{}",
+        mode.width,
+        mode.height,
+        fmt_fps(mode.fps()),
+        match (&mode.kind, mode.ten_bit()) {
+            (Kind::Mjpeg, _) => " MJPEG",
+            (_, true) => " 10-bit HDR",
+            _ if opts.hdr_signal => " 8-bit HDR",
+            _ => " lossless",
+        }
+    );
+    println!("{} {} at {label}", log::green("opening"), card.name);
+
+    let pipeline = gst::Pipeline::new();
+
+    // Video branch. Everything after the source runs on the GPU through OpenGL:
+    // converting 4K60 frames on the CPU is what made the first version lag.
+    let hdr = is_hdr(&mode, opts.hdr_signal);
+    let (mut chain, caps) = capture_chain(card, &mode, hdr)?;
+    chain.push(make("queue")?);
+    chain.extend(display_chain(hdr)?);
     pipeline
         .add_many(&chain)
         .map_err(|e| format!("could not build the video pipeline: {e}"))?;
@@ -369,7 +397,7 @@ fn watch(pipeline: &gst::Pipeline, frames: &AtomicU64, target: f64) -> Result<()
     }
 }
 
-fn fmt_fps(f: f64) -> String {
+pub(crate) fn fmt_fps(f: f64) -> String {
     if (f - f.round()).abs() < 0.01 {
         format!("{}", f.round() as i64)
     } else {

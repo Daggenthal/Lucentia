@@ -224,6 +224,41 @@ pub fn find_audio_for(card: &CaptureDevice) -> Option<gst::Device> {
     by_serial.or(by_name)
 }
 
+/// Microphones and other audio inputs, without speaker "monitor" sources.
+pub fn list_mics() -> Vec<gst::Device> {
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Audio/Source"), None);
+    if monitor.start().is_err() {
+        log::warn("could not start the audio device monitor");
+        return Vec::new();
+    }
+    let devices = monitor.devices();
+    monitor.stop();
+    devices
+        .into_iter()
+        .filter(|d| {
+            let props = d.properties().map(|p| p.to_string()).unwrap_or_default();
+            !props.contains(".monitor") && !d.device_class().contains("Monitor")
+        })
+        .collect()
+}
+
+/// Find a mic by (part of) its name, case-insensitive. "default" picks the system's
+/// default input.
+pub fn find_mic(name: &str) -> Option<gst::Device> {
+    let mics = list_mics();
+    if name.eq_ignore_ascii_case("default") {
+        return mics.into_iter().find(|d| {
+            d.properties()
+                .and_then(|p| p.get::<bool>("is-default").ok())
+                .unwrap_or(false)
+        });
+    }
+    let needle = name.to_lowercase();
+    mics.into_iter()
+        .find(|d| d.display_name().to_lowercase().contains(&needle))
+}
+
 /// "0x0FD9" and "0fd9" both become "0fd9".
 fn norm_id(s: String) -> String {
     s.trim().trim_start_matches("0x").to_lowercase()
