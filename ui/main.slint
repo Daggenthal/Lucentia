@@ -19,21 +19,33 @@ component Hint inherits Text {
     wrap: word-wrap;
 }
 
-// A small square button with an icon, e.g. mute.
-component IconButton inherits Rectangle {
+// A mute toggle with an icon and a short label, shown under the preview.
+component MuteButton inherits Rectangle {
     in property <image> icon;
-    in property <bool> active: false;
-    in property <string> tip;
+    in property <string> text;
+    in property <bool> muted: false;
     callback clicked();
-    width: 32px;
     height: 32px;
-    border-radius: 6px;
-    background: root.active ? #d0303040 : (touch.has-hover ? Palette.foreground.transparentize(0.88) : transparent);
-    Image {
-        width: 20px;
-        height: 20px;
-        source: root.icon;
-        colorize: root.active ? #e04548 : Palette.foreground;
+    width: row.preferred-width;
+    border-radius: 16px;
+    background: root.muted ? #d0303040 : (touch.has-hover ? Palette.foreground.transparentize(0.85) : Palette.foreground.transparentize(0.92));
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 14px;
+        spacing: 8px;
+        Image {
+            width: 18px;
+            height: 18px;
+            y: (parent.height - self.height) / 2;
+            source: root.icon;
+            colorize: root.muted ? #e04548 : Palette.foreground;
+        }
+        Text {
+            text: root.text;
+            color: root.muted ? #e04548 : Palette.foreground;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
     }
     touch := TouchArea {
         clicked => { root.clicked(); }
@@ -150,10 +162,10 @@ export component AppWindow inherits Window {
                 // The video box: as big as fits while keeping the video's shape, so
                 // the picture always fills it and there are no bars on resize.
                 video-box := Rectangle {
-                    width: min(parent.width, parent.height * root.preview-aspect);
+                    width: min(parent.width, (parent.height - 44px) * root.preview-aspect);
                     height: self.width / root.preview-aspect;
                     x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
+                    y: (parent.height - 44px - self.height) / 2;
                     background: #000000;
                     border-radius: 8px;
                     clip: true;
@@ -200,6 +212,33 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                }
+                // Quick controls under the preview. These work while recording too.
+                HorizontalLayout {
+                    x: video-box.x;
+                    y: video-box.y + video-box.height + 10px;
+                    width: video-box.width;
+                    height: 32px;
+                    spacing: 8px;
+                    alignment: start;
+                    if root.game-audio: MuteButton {
+                        icon: root.listen-muted ? @image-url("icons/speaker-off.svg") : @image-url("icons/speaker.svg");
+                        text: "Audio";
+                        muted: root.listen-muted;
+                        clicked => {
+                            root.listen-muted = !root.listen-muted;
+                            root.audio-levels-changed();
+                        }
+                    }
+                    if root.mic-index > 0: MuteButton {
+                        icon: root.mic-muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
+                        text: "Mic";
+                        muted: root.mic-muted;
+                        clicked => {
+                            root.mic-muted = !root.mic-muted;
+                            root.audio-levels-changed();
+                        }
+                    }
                 }
             }
 
@@ -365,19 +404,6 @@ export component AppWindow inherits Window {
                                         checked <=> root.game-audio;
                                         toggled => { root.game-audio-toggled(); }
                                     }
-                                    IconButton {
-                                        icon: root.listen-muted ? @image-url("icons/speaker-off.svg") : @image-url("icons/speaker.svg");
-                                        active: root.listen-muted;
-                                        clicked => {
-                                            root.listen-muted = !root.listen-muted;
-                                            root.audio-levels-changed();
-                                        }
-                                    }
-                                }
-                                Hint {
-                                    text: root.listen-muted ? "Speakers muted. The recording still has the game audio." : "";
-                                    visible: root.listen-muted;
-                                    height: root.listen-muted ? self.preferred-height : 0;
                                 }
                                 Row {
                                     Label { text: "Game " + round(root.game-volume) + "%"; width: 90px; }
@@ -399,14 +425,6 @@ export component AppWindow inherits Window {
                                         model: root.mics;
                                         current-index <=> root.mic-index;
                                         selected => { root.settings-changed(); }
-                                    }
-                                    if root.mic-index > 0: IconButton {
-                                        icon: root.mic-muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
-                                        active: root.mic-muted;
-                                        clicked => {
-                                            root.mic-muted = !root.mic-muted;
-                                            root.audio-levels-changed();
-                                        }
                                     }
                                 }
                                 if root.mic-index > 0: Row {

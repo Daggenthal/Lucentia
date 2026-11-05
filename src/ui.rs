@@ -23,6 +23,7 @@ use crate::estimate;
 use crate::log;
 use crate::preview::{self, Frame};
 use crate::record::{self, Container, StopHandle};
+use std::sync::mpsc;
 
 slint::include_modules!();
 
@@ -37,9 +38,8 @@ struct RateChoice {
 }
 
 struct Running {
+    session: Arc<record::Session>,
     stop: StopHandle,
-    controls: record::Controls,
-    recording: bool,
     generation: u64,
 }
 
@@ -53,8 +53,12 @@ struct State {
     /// Bitrate the app last filled in by itself; if the user changed it, keep theirs.
     auto_bitrate: i32,
     running: Option<Running>,
-    /// What to start once the running session has ended.
-    pending: Option<bool>,
+    /// Start a new session once the running one has let go of the card.
+    pending: bool,
+    /// Record as soon as the next session starts (continuing after a dropout).
+    record_on_start: bool,
+    /// The mic menu entry the running session opened.
+    session_mic: i32,
     generation: u64,
     /// Recordings still being finished (mixed, converted) in the background.
     finishing: u32,
@@ -104,7 +108,9 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         output_dir,
         auto_bitrate: 0,
         running: None,
-        pending: None,
+        pending: false,
+        record_on_start: false,
+        session_mic: 0,
         generation: 0,
         finishing: 0,
         auto_restarts: Vec::new(),
@@ -148,7 +154,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             fill_resolutions(&ui, &s);
             fill_rates(&ui, &s);
             refresh_estimate(&ui, &s);
-            restart(&ui, &s, false);
+            restart(&ui, &s);
         });
     }
     {
@@ -157,7 +163,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             let ui = w.unwrap();
             fill_rates(&ui, &s);
             refresh_estimate(&ui, &s);
-            restart(&ui, &s, false);
+            restart(&ui, &s);
         });
     }
     {
@@ -165,6 +171,12 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         ui.on_settings_changed(move || {
             let ui = w.unwrap();
             refresh_estimate(&ui, &s);
+            // The mic is opened by the session, so picking a different one restarts
+            // the preview (only while not recording; the menu is locked then).
+            let mic = ui.get_mic_index();
+            if s.borrow().session_mic != mic && !ui.get_recording() {
+                restart(&ui, &s);
+            }
         });
     }
     {
@@ -173,9 +185,8 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         ui.on_game_audio_toggled(move || {
             let ui = w.unwrap();
             refresh_estimate(&ui, &s);
-            let idle = s.borrow().running.as_ref().is_none_or(|r| !r.recording);
-            if idle {
-                restart(&ui, &s, false);
+            if !ui.get_recording() {
+                restart(&ui, &s);
             }
         });
     }
@@ -185,12 +196,14 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         ui.on_audio_levels_changed(move || {
             let ui = w.unwrap();
             if let Some(r) = &s.borrow().running {
-                r.controls
+                r.session
+                    .controls
                     .set_game_volume(ui.get_game_volume().round() as f64);
-                r.controls
+                r.session
+                    .controls
                     .set_mic_volume(ui.get_mic_volume().round() as f64);
-                r.controls.set_listen_muted(ui.get_listen_muted());
-                r.controls.set_mic_muted(ui.get_mic_muted());
+                r.session.controls.set_listen_muted(ui.get_listen_muted());
+                r.session.controls.set_mic_muted(ui.get_mic_muted());
             }
         });
     }
@@ -198,15 +211,10 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         let (w, s) = (ui.as_weak(), state.clone());
         ui.on_record_clicked(move || {
             let ui = w.unwrap();
-            let recording = s.borrow().running.as_ref().is_some_and(|r| r.recording);
-            if recording {
-                if let Some(r) = &s.borrow().running {
-                    ui.set_busy(true);
-                    r.stop.stop();
-                }
-                s.borrow_mut().pending = Some(false);
+            if ui.get_recording() {
+                stop_recording(&ui, &s);
             } else {
-                restart(&ui, &s, true);
+                start_recording(&ui, &s);
             }
         });
     }
@@ -234,13 +242,23 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         });
     }
 
-    restart(&ui, &state, false);
+    restart(&ui, &state);
     ui.run().map_err(|e| e.to_string())?;
 
     // Window closed: stop whatever is running and wait for every session to finish
     // its file, so a recording is never cut off.
     if let Some(r) = state.borrow_mut().running.take() {
+        // The session's end of stream also completes an attached recording's file.
         r.stop.stop();
+        let session = r.session.clone();
+        let opts = options(&ui, &state.borrow(), true);
+        state.borrow_mut().workers.push(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            if let (Some(rec), Some(opts)) = (session.stop_recording(), opts) {
+                let _ = session.wait_recording(&rec, Duration::from_secs(10));
+                let _ = record::finish_recording(rec, &opts);
+            }
+        }));
     }
     let workers = std::mem::take(&mut state.borrow_mut().workers);
     if !workers.is_empty() {
@@ -494,7 +512,7 @@ fn refresh_estimate(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 ));
             }
             ui.set_estimate(text.into());
-            if !s.running.as_ref().is_some_and(|r| r.recording) {
+            if !ui.get_recording() {
                 show(ui, &plan.warnings.join(" "), false);
             }
         }
@@ -517,21 +535,23 @@ fn show_success(ui: &AppWindow, message: &str) {
     ui.set_message_is_success(true);
 }
 
-/// Start a session (preview, or preview + recording), stopping the current one first.
-fn restart(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
+/// Start a new preview session (the card opens once and stays open), stopping the
+/// current one first. Only for things that change the session's inputs: device, mode,
+/// game audio on/off, mic choice.
+fn restart(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     if let Some(r) = &state.borrow().running {
         r.stop.stop();
     }
     if state.borrow().running.is_some() {
         // Start it once the current session has let go of the card (see `released`).
-        state.borrow_mut().pending = Some(record_on);
+        state.borrow_mut().pending = true;
         return;
     }
-    start_now(ui, state, record_on);
+    start_session(ui, state);
 }
 
-fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
-    let Some(mut opts) = options(ui, &state.borrow(), record_on) else {
+fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let Some(mut opts) = options(ui, &state.borrow(), false) else {
         ui.set_has_preview(false);
         ui.set_preview_message("This device reported no usable modes.".into());
         return;
@@ -559,6 +579,7 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
     let generation = {
         let mut s = state.borrow_mut();
         s.generation += 1;
+        s.session_mic = ui.get_mic_index();
         s.generation
     };
 
@@ -568,7 +589,7 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
         record::plan(card, &opts).and_then(|plan| record::start(card, &opts, plan))
     };
     let session = match session {
-        Ok(sess) => sess,
+        Ok(sess) => Arc::new(sess),
         Err(e) => {
             ui.set_has_preview(false);
             ui.set_preview_message("No preview".into());
@@ -581,26 +602,9 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
     let mode = &session.plan.mode;
     ui.set_preview_aspect(mode.width as f32 / mode.height.max(1) as f32);
 
-    if record_on {
-        let mut warn = session.plan.warnings.clone();
-        warn.insert(
-            0,
-            format!("Recording to {}", session.plan.final_path.display()),
-        );
-        show(ui, &warn.join(" "), false);
-    }
-    ui.set_recording(record_on);
-    ui.set_lost_text("0".into());
-    ui.set_lost_warning(false);
-    ui.set_size_text("–".into());
-    ui.set_bitrate_text("–".into());
-    ui.set_drive_text("–".into());
-    ui.set_time_text("0:00".into());
-
     state.borrow_mut().running = Some(Running {
         stop: session.stop_handle(),
-        controls: session.controls.clone(),
-        recording: record_on,
+        session: session.clone(),
         generation,
     });
 
@@ -609,33 +613,113 @@ fn start_now(ui: &AppWindow, state: &Rc<RefCell<State>>, record_on: bool) {
         let stats_weak = weak.clone();
         let watched = session.watch(None, Duration::from_secs(1), |st| {
             let st = st.clone();
-            let _ = stats_weak.upgrade_in_event_loop(move |ui| show_stats(&ui, &st, record_on));
+            let _ = stats_weak.upgrade_in_event_loop(move |ui| show_stats(&ui, &st));
         });
-
-        // Let go of the card first, so the preview can come straight back while the
-        // file is finished (mixed, converted) in the background.
+        // An error mid-recording: take what was recorded so far.
+        let interrupted = session.abandon_recording();
         session.release();
         let error = watched.err();
-        {
-            let error = error.clone();
-            let _ =
-                weak.upgrade_in_event_loop(move |ui| released(&ui, generation, record_on, error));
+        let had_recording = interrupted.is_some();
+        let _ =
+            weak.upgrade_in_event_loop(move |ui| released(&ui, generation, had_recording, error));
+        if let Some(rec) = interrupted {
+            let _ = session.wait_recording(&rec, Duration::from_secs(1));
+            let (tx, rx) = mpsc::channel();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                let opts = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|st| options(&ui, &st.borrow(), true))
+                });
+                let _ = tx.send(opts);
+            });
+            if let Ok(Some(opts)) = rx.recv() {
+                let finished = record::finish_recording(rec, &opts);
+                let _ =
+                    weak.upgrade_in_event_loop(move |ui| finished_recording(&ui, Some(finished)));
+            }
         }
-        if session.is_recording() {
-            let finished = session.finish(&opts);
-            let _ = weak.upgrade_in_event_loop(move |ui| finished_recording(&ui, finished));
+    });
+    let mut s = state.borrow_mut();
+    s.workers.retain(|w| !w.is_finished());
+    s.workers.push(worker);
+    drop(s);
+
+    if std::mem::take(&mut state.borrow_mut().record_on_start) {
+        start_recording(ui, state);
+    }
+}
+
+/// Attach a recording to the running session. The capture isn't touched.
+fn start_recording(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let Some(session) = state.borrow().running.as_ref().map(|r| r.session.clone()) else {
+        show(ui, "Nothing to record: the capture isn't running.", true);
+        return;
+    };
+    let result = {
+        let s = state.borrow();
+        match options(ui, &s, true) {
+            Some(opts) => record::plan(card(ui, &s), &opts)
+                .and_then(|plan| session.start_recording(&opts, plan.clone()).map(|_| plan)),
+            None => Err("no usable mode selected".to_string()),
         }
+    };
+    match result {
+        Ok(plan) => {
+            let mut text = vec![format!("Recording to {}", plan.final_path.display())];
+            text.extend(plan.warnings);
+            show(ui, &text.join(" "), false);
+            ui.set_recording(true);
+            ui.set_lost_text("0".into());
+            ui.set_lost_warning(false);
+            ui.set_size_text("–".into());
+            ui.set_bitrate_text("–".into());
+            ui.set_drive_text("–".into());
+            ui.set_time_text("0:00".into());
+        }
+        Err(e) => show(ui, &e, true),
+    }
+}
+
+/// Detach the recording and finish its file in the background. The preview and the
+/// capture keep running untouched.
+fn stop_recording(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let Some(session) = state.borrow().running.as_ref().map(|r| r.session.clone()) else {
+        return;
+    };
+    let Some(rec) = session.stop_recording() else {
+        ui.set_recording(false);
+        return;
+    };
+    let Some(opts) = options(ui, &state.borrow(), true) else {
+        return;
+    };
+    ui.set_recording(false);
+    {
+        let mut s = state.borrow_mut();
+        s.finishing += 1;
+    }
+    ui.set_busy(true);
+    show(ui, "Finishing the recording…", false);
+
+    let weak = ui.as_weak();
+    let worker = std::thread::spawn(move || {
+        if !session.wait_recording(&rec, Duration::from_secs(60)) {
+            log::warn("the recording took too long to close; finishing what was written");
+        }
+        let finished = record::finish_recording(rec, &opts);
+        let _ = weak.upgrade_in_event_loop(move |ui| finished_recording(&ui, Some(finished)));
     });
     let mut s = state.borrow_mut();
     s.workers.retain(|w| !w.is_finished());
     s.workers.push(worker);
 }
 
-fn show_stats(ui: &AppWindow, st: &record::Stats, recording: bool) {
+fn show_stats(ui: &AppWindow, st: &record::Stats) {
     ui.set_fps_text(format!("{:.2}", st.fps).into());
     ui.set_lost_text(st.lost.to_string().into());
     ui.set_lost_warning(st.lost > 0);
-    if recording {
+    if st.recording {
         let t = st.elapsed as u64;
         let time = if t >= 3600 {
             format!("{}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
@@ -654,8 +738,8 @@ fn show_stats(ui: &AppWindow, st: &record::Stats, recording: bool) {
     }
 }
 
-/// A session has stopped and let go of the card. Start whatever comes next right away:
-/// the preview after Stop, or (after a signal drop mid-recording) a new recording.
+/// A session has stopped and let go of the card. Start the next one right away:
+/// after a settings change, or (after a dropout mid-recording) to keep recording.
 fn released(ui: &AppWindow, generation: u64, was_recording: bool, error: Option<String>) {
     let Some(state) = STATE.with(|s| s.borrow().clone()) else {
         return;
@@ -671,11 +755,15 @@ fn released(ui: &AppWindow, generation: u64, was_recording: bool, error: Option<
     state.borrow_mut().running = None;
     ui.set_recording(false);
 
-    let mut next = state.borrow_mut().pending.take();
+    let mut start = std::mem::take(&mut state.borrow_mut().pending);
+    if was_recording {
+        state.borrow_mut().finishing += 1;
+        ui.set_busy(true);
+    }
     if let Some(e) = &error {
-        if was_recording && next.is_none() && may_auto_continue(&state) {
-            // The signal dropped mid-recording (e.g. the console switched HDMI modes
-            // when a game started). Keep going in a new file rather than stopping.
+        if was_recording && may_auto_continue(&state) {
+            // The capture dropped out mid-recording. Keep going in a new file rather
+            // than stopping.
             show(
                 ui,
                 &format!(
@@ -683,23 +771,17 @@ fn released(ui: &AppWindow, generation: u64, was_recording: bool, error: Option<
                 ),
                 true,
             );
-            next = Some(true);
+            state.borrow_mut().record_on_start = true;
+            start = true;
         } else {
             show(ui, e, true);
         }
     }
-    if was_recording {
-        // The file is still being finished in the background.
-        state.borrow_mut().finishing += 1;
-        ui.set_busy(true);
-    }
-    match next {
-        Some(record_on) => start_now(ui, &state, record_on),
-        None if error.is_none() || was_recording => start_now(ui, &state, false),
-        None => {
-            ui.set_has_preview(false);
-            ui.set_preview_message("Preview stopped. Change a setting to try again.".into());
-        }
+    if start {
+        start_session(ui, &state);
+    } else if error.is_some() {
+        ui.set_has_preview(false);
+        ui.set_preview_message("Preview stopped. Change a setting to try again.".into());
     }
 }
 
