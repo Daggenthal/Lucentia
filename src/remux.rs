@@ -78,6 +78,10 @@ pub fn finalize(
     }
 }
 
+/// Name of the mixed track. No spaces: GStreamer's MKV writer stores tag values in
+/// its escaped form, so "Game + Mic" would show up as "Game\ +\ Mic" in quotes.
+pub const MIX_TITLE: &str = "Game+Mic";
+
 /// Share of the progress bar for the mix stage when there is one.
 const MIX_SHARE: f64 = 0.55;
 
@@ -274,7 +278,7 @@ fn copy_into(
                 return;
             };
             if let Some(t) = target.lock().unwrap().take() {
-                if let Err(e) = link_copy(&pipeline, pad, &t, Some("Game + Mic")) {
+                if let Err(e) = link_copy(&pipeline, pad, &t, Some(MIX_TITLE)) {
                     log::warn(&format!("finishing: {e}"));
                 }
             }

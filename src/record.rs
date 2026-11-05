@@ -591,6 +591,14 @@ impl Session {
                 let Some(pts) = info.buffer().and_then(|b| b.pts()) else {
                     return gst::PadProbeReturn::Ok;
                 };
+                // Anything from before Record was pressed would land before the
+                // file's start. The muxer throws those away, and if the first one
+                // was the keyframe, the video decodes as gray smears until the next
+                // keyframe (about 2 s). The card's frames arrive a little late, so
+                // there are usually a few of these; drop them before the encoder.
+                if (pts.nseconds() as i64) + extra < now {
+                    return gst::PadProbeReturn::Drop;
+                }
                 if is_video {
                     let _ = fv.compare_exchange(
                         u64::MAX,
@@ -1011,15 +1019,20 @@ fn add_audio_source(
     let mut speakers = None;
     if listen {
         // Its own volume element mutes the speakers without touching recordings.
+        // The speakers play whatever arrives, without matching timestamps to the
+        // pipeline clock. The card's audio and the speakers run on different clocks,
+        // and when the sink tried to keep them lined up (or frames arrived late under
+        // load) it got stuck dropping and padding audio: choppy until a mute reset it.
+        // A short leaky queue keeps the delay low if the card runs a hair fast.
         let q = make("queue")?;
         q.set_property_from_str("leaky", "downstream");
+        q.set_property("max-size-buffers", 0u32);
+        q.set_property("max-size-bytes", 0u32);
+        q.set_property("max-size-time", 150_000_000u64);
         let mute = make("volume")?;
-        let out = [
-            q,
-            mute.clone(),
-            make("audioconvert")?,
-            make("autoaudiosink")?,
-        ];
+        let sink = make("autoaudiosink")?;
+        sink.set_property("sync", false);
+        let out = [q, mute.clone(), make("audioconvert")?, sink];
         add_chain(pipeline, &out, "speakers")?;
         tee.link(&out[0])
             .map_err(|_| "could not connect the speakers")?;

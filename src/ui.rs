@@ -141,6 +141,17 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             log::warn(&format!("could not save the setting: {e}"));
         }
     });
+    ui.set_settings_open(load_setting("settings_open").as_deref() == Some("true"));
+    {
+        let weak = ui.as_weak();
+        ui.on_settings_toggled(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let open = if ui.get_settings_open() { "true" } else { "false" };
+            if let Err(e) = save_setting("settings_open", open) {
+                log::warn(&format!("could not save the setting: {e}"));
+            }
+        });
+    }
     ui.on_theme_changed(|i| {
         let name = match i {
             1 => "light",

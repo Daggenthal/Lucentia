@@ -151,13 +151,59 @@ export component AppWindow inherits Window {
     callback record-clicked();
     callback choose-folder();
     callback open-folder();
+    // The settings panel was shown or hidden (to remember it).
+    callback settings-toggled();
+    in-out property <bool> settings-open: false;
 
-    HorizontalLayout {
+    function toggle-settings() {
+        root.settings-open = !root.settings-open;
+        root.settings-toggled();
+    }
+
         // ---- Preview -------------------------------------------------------------
         VerticalLayout {
             padding: 16px;
+            padding-top: 10px;
             spacing: 12px;
-            horizontal-stretch: 1;
+
+            // Top bar: name on the left, Settings on the right.
+            HorizontalLayout {
+                height: 40px;
+                Text {
+                    text: "Lucentia";
+                    color: Palette.foreground;
+                    font-size: 20px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Rectangle {
+                    width: gear-row.preferred-width;
+                    border-radius: 8px;
+                    background: Palette.foreground.transparentize(gear-touch.has-hover ? 0.85 : 0.92);
+                    gear-row := HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 14px;
+                        spacing: 8px;
+                        Image {
+                            width: 20px;
+                            height: 20px;
+                            y: (parent.height - self.height) / 2;
+                            source: @image-url("icons/settings.svg");
+                            colorize: Palette.foreground;
+                        }
+                        Text {
+                            text: "Settings";
+                            color: Palette.foreground;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    gear-touch := TouchArea {
+                        clicked => { root.toggle-settings(); }
+                    }
+                }
+            }
 
             Rectangle {
                 vertical-stretch: 1;
@@ -259,6 +305,31 @@ export component AppWindow inherits Window {
                 Stat { label: "BITRATE"; value: root.recording ? root.bitrate-text : "–"; }
                 Stat { label: "DRIVE"; value: root.drive-text; }
                 Rectangle { horizontal-stretch: 1; }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: end;
+                    // Record / Stop.
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        width: max(170px, rec-text.preferred-width + 40px);
+                        height: 44px;
+                        border-radius: 8px;
+                        background: root.busy ? #6b7280
+                            : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
+                            : (touch.has-hover ? #e04548 : #d23a3d);
+                        rec-text := Text {
+                            text: root.busy ? root.finish-text : root.recording ? "Stop recording" : "Record";
+                            color: #ffffff;
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                        touch := TouchArea {
+                            enabled: !root.busy;
+                            clicked => { root.record-clicked(); }
+                        }
+                    }
+                }
             }
 
             if root.message != "": Rectangle {
@@ -279,10 +350,23 @@ export component AppWindow inherits Window {
             }
         }
 
-        // ---- Settings ------------------------------------------------------------
+        // ---- Settings drawer ------------------------------------------------------
+        // Slides in from the right over the preview. Click outside it to close.
+        if root.settings-open: TouchArea {
+            clicked => { root.toggle-settings(); }
+            Rectangle { background: #00000050; }
+        }
         Rectangle {
-            width: 380px;
+            x: root.settings-open ? parent.width - self.width : parent.width;
+            y: 0;
+            width: 400px;
+            height: parent.height;
+            animate x { duration: 220ms; easing: ease-out; }
             background: Palette.alternate-background;
+            drop-shadow-blur: root.settings-open ? 24px : 0px;
+            drop-shadow-color: #00000070;
+            // Swallow clicks so they don't reach the preview underneath.
+            TouchArea { }
 
             VerticalLayout {
                 ScrollView {
@@ -291,11 +375,29 @@ export component AppWindow inherits Window {
                         padding: 16px;
                         spacing: 14px;
 
-                        Text {
-                            text: "Lucentia";
-                            color: Palette.foreground;
-                            font-size: 22px;
-                            font-weight: 700;
+                        HorizontalLayout {
+                            Text {
+                                text: "Settings";
+                                color: Palette.foreground;
+                                font-size: 22px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Rectangle {
+                                width: 32px;
+                                height: 32px;
+                                border-radius: 6px;
+                                background: close-touch.has-hover ? Palette.foreground.transparentize(0.85) : transparent;
+                                Text {
+                                    text: "✕";
+                                    color: Palette.foreground;
+                                    font-size: 16px;
+                                }
+                                close-touch := TouchArea {
+                                    clicked => { root.toggle-settings(); }
+                                }
+                            }
                         }
 
                         GroupBox {
@@ -522,28 +624,6 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Record button, always visible.
-                VerticalLayout {
-                    padding: 16px;
-                    Rectangle {
-                        height: 48px;
-                        border-radius: 8px;
-                        background: root.busy ? #6b7280
-                            : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
-                            : (touch.has-hover ? #e04548 : #d23a3d);
-                        Text {
-                            text: root.busy ? root.finish-text : root.recording ? "Stop recording" : "Record";
-                            color: #ffffff;
-                            font-size: 16px;
-                            font-weight: 700;
-                        }
-                        touch := TouchArea {
-                            enabled: !root.busy;
-                            clicked => { root.record-clicked(); }
-                        }
-                    }
-                }
             }
         }
-    }
 }
