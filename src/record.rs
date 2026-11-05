@@ -16,7 +16,7 @@
 use gst::prelude::*;
 use gstreamer as gst;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,8 @@ pub struct Options {
     pub listen_muted: bool,
     /// Start with the mic muted in the recording.
     pub mic_muted: bool,
+    /// Remove the game's sound from the mic (when speakers play it into the mic).
+    pub echo_cancel: bool,
 }
 
 /// Live controls for a running session: change volume and mute without restarting.
@@ -105,10 +107,19 @@ impl Controls {
     }
 }
 
-/// Default bitrate: 40 Mbit/s at 1080p60, scaled by pixels per second, within 10 to 200.
-pub fn default_kbps(mode: &Mode) -> u32 {
+/// Default bitrate: 40 Mbit/s for H.264 at 1080p60, scaled by pixels per second and
+/// by how efficient the codec is (HEVC and AV1 look the same with fewer bits), within
+/// 10 to 200 Mbit/s.
+pub fn default_kbps(mode: &Mode, codec: Codec) -> u32 {
     let ratio = (mode.width as f64 * mode.height as f64 * mode.fps()) / (1920.0 * 1080.0 * 60.0);
-    (40_000.0 * ratio).clamp(10_000.0, 200_000.0).round() as u32
+    let efficiency = match codec {
+        Codec::Hevc => 0.7,
+        Codec::Av1 => 0.6,
+        _ => 1.0,
+    };
+    (40_000.0 * ratio * efficiency)
+        .clamp(10_000.0, 200_000.0)
+        .round() as u32
 }
 
 /// Everything decided before a session starts: the mode, encoder settings, where the
@@ -167,7 +178,7 @@ pub fn plan(card: Option<&CaptureDevice>, opts: &Options) -> Result<Plan, String
     }
 
     let rate = opts.rate.unwrap_or(RateControl::Cbr {
-        kbps: default_kbps(&mode),
+        kbps: default_kbps(&mode, codec),
     });
     let output_fps = opts
         .record_fps
@@ -321,7 +332,23 @@ pub struct Session {
     /// Recordings whose files are complete (their end of stream reached the file).
     finished_bins: Arc<(Mutex<Vec<String>>, std::sync::Condvar)>,
     next_recording: AtomicU64,
+    /// The virtual camera output, when on: its bin and the tee pad feeding it.
+    virtual_camera: Mutex<Option<(gst::Bin, gst::Pad)>>,
+    /// Latest audio peaks in dB (f32 bits), game then mic, for the level meters.
+    levels: Arc<[AtomicU32; 2]>,
 }
+
+/// Where the clean video feed goes, for OBS, Discord and browsers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VirtualCamera {
+    /// A PipeWire camera node ("Lucentia"), no kernel module needed.
+    PipeWire,
+    /// A v4l2loopback device such as /dev/video10, which every camera app can open.
+    Loopback(PathBuf),
+}
+
+/// What the level meters show when there's no sound (or no source).
+const SILENT_DB: f32 = -100.0;
 
 fn new_tee() -> Result<gst::Element, String> {
     let t = make("tee")?;
@@ -383,7 +410,7 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
             None => Some(test_tone(440.0)?),
         };
         if let Some(src) = src {
-            let t = add_audio_source(&pipeline, src, "game audio", opts.game_volume, showing)?;
+            let t = add_audio_source(&pipeline, src, "game audio", opts.game_volume, showing, None)?;
             if let Some(l) = &t.listen {
                 l.set_property("mute", opts.listen_muted);
             }
@@ -404,7 +431,19 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
             log::debug(&format!("mic {}", dev.display_name()));
             preview::audio_source(&dev)?
         };
-        let t = add_audio_source(&pipeline, src, "mic", opts.mic_volume, false)?;
+        // Echo cancellation: the game audio is the reference for what the speakers
+        // play, and whatever of it the mic picks up is subtracted from the mic.
+        let dsp = match (&game_tee, opts.echo_cancel) {
+            (Some(game), true) => match echo_canceller(&pipeline, game) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    log::warn(&format!("echo cancellation unavailable: {e}"));
+                    None
+                }
+            },
+            _ => None,
+        };
+        let t = add_audio_source(&pipeline, src, "mic", opts.mic_volume, false, dsp)?;
         t.volume.set_property("mute", opts.mic_muted);
         controls.mic_volume = Some(t.volume);
         mic_tee = Some(t.tee);
@@ -468,7 +507,35 @@ pub fn start(card: Option<&CaptureDevice>, opts: &Options, plan: Plan) -> Result
         recording: Mutex::new(None),
         finished_bins: Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new())),
         next_recording: AtomicU64::new(1),
+        virtual_camera: Mutex::new(None),
+        levels: Arc::new([
+            AtomicU32::new(SILENT_DB.to_bits()),
+            AtomicU32::new(SILENT_DB.to_bits()),
+        ]),
     })
+}
+
+/// v4l2loopback devices on this machine (virtual video devices, not real cameras).
+pub fn loopback_devices() -> Vec<(PathBuf, String)> {
+    let Ok(dir) = std::fs::read_dir("/sys/class/video4linux") else {
+        return Vec::new();
+    };
+    let mut found: Vec<(PathBuf, String)> = dir
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            // Loopback devices are virtual: they live under /sys/devices/virtual.
+            std::fs::canonicalize(e.path())
+                .is_ok_and(|p| p.to_string_lossy().contains("/devices/virtual/"))
+        })
+        .map(|e| {
+            let name = std::fs::read_to_string(e.path().join("name"))
+                .map(|n| n.trim().to_string())
+                .unwrap_or_default();
+            (PathBuf::from("/dev").join(e.file_name()), name)
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 impl Session {
@@ -690,6 +757,146 @@ impl Session {
         done
     }
 
+    /// Turn the virtual camera on (or switch it), or off with None. Like a
+    /// recording, it attaches to the running capture without reopening the card.
+    pub fn set_virtual_camera(&self, target: Option<VirtualCamera>) -> Result<(), String> {
+        let mut current = self.virtual_camera.lock().unwrap();
+        if let Some((bin, tee_pad)) = current.take() {
+            let ghost = bin.static_pad("sink");
+            let (bin2, pipeline, tee) = (bin.clone(), self.pipeline.clone(), self.video_tee.clone());
+            tee_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+                if let Some(g) = &ghost {
+                    let _ = pad.unlink(g);
+                }
+                let (bin, pipeline, tee, pad) = (bin2.clone(), pipeline.clone(), tee.clone(), pad.clone());
+                // Tear down off the streaming thread.
+                std::thread::spawn(move || {
+                    let _ = bin.set_state(gst::State::Null);
+                    let _ = pipeline.remove(&bin);
+                    tee.release_request_pad(&pad);
+                });
+                gst::PadProbeReturn::Remove
+            });
+            log::debug("virtual camera off");
+        }
+        let Some(target) = target else {
+            return Ok(());
+        };
+
+        let bin = gst::Bin::with_name("virtual-camera");
+        // Leaky: if a viewer stalls, drop frames for it instead of holding up the
+        // preview and recording.
+        let q = make("queue")?;
+        q.set_property_from_str("leaky", "downstream");
+        q.set_property("max-size-buffers", 3u32);
+        q.set_property("max-size-bytes", 0u32);
+        q.set_property("max-size-time", 0u64);
+        let convert = make("videoconvert")?;
+        let scale = make("videoscale")?;
+        let caps = make("capsfilter")?;
+        // At most 1080p: what Discord and browsers handle well, and light to convert.
+        let mode = &self.plan.mode;
+        let (w, h) = if mode.width > 1920 {
+            (1920, (1920 * mode.height / mode.width.max(1)) & !1)
+        } else {
+            (mode.width, mode.height)
+        };
+        let format = match target {
+            // v4l2loopback readers (Chromium, Discord) like YUY2 best.
+            VirtualCamera::Loopback(_) => "YUY2",
+            VirtualCamera::PipeWire => "NV12",
+        };
+        caps.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", format)
+                .field("width", w)
+                .field("height", h)
+                .build(),
+        );
+        let sink = match &target {
+            VirtualCamera::PipeWire => {
+                let s = make("pipewiresink")?;
+                if s.find_property("mode").is_some() {
+                    s.set_property_from_str("mode", "provide");
+                }
+                s.set_property("client-name", "Lucentia");
+                s.set_property(
+                    "stream-properties",
+                    gst::Structure::builder("props")
+                        .field("media.class", "Video/Source")
+                        .field("media.role", "Camera")
+                        .field("node.name", "lucentia")
+                        .field("node.description", "Lucentia (capture card)")
+                        .build(),
+                );
+                s
+            }
+            VirtualCamera::Loopback(dev) => {
+                let s = make("v4l2sink")?;
+                s.set_property("device", dev.to_string_lossy().to_string());
+                s
+            }
+        };
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+        let chain = [q.clone(), convert, scale, caps, sink];
+        bin.add_many(&chain).map_err(|e| e.to_string())?;
+        gst::Element::link_many(&chain).map_err(|_| "could not build the virtual camera")?;
+        let ghost = gst::GhostPad::builder_with_target(&q.static_pad("sink").unwrap())
+            .map_err(|e| e.to_string())?
+            .name("sink")
+            .build();
+        bin.add_pad(&ghost).map_err(|e| e.to_string())?;
+        self.pipeline.add(&bin).map_err(|e| e.to_string())?;
+        if bin.sync_state_with_parent().is_err() {
+            let _ = bin.set_state(gst::State::Null);
+            let _ = self.pipeline.remove(&bin);
+            return Err(match target {
+                VirtualCamera::PipeWire => "could not create the PipeWire camera. Is PipeWire running?".into(),
+                VirtualCamera::Loopback(d) => format!("could not open {} (v4l2loopback)", d.display()),
+            });
+        }
+        let tee_pad = self
+            .video_tee
+            .request_pad_simple("src_%u")
+            .ok_or("the capture refused another output")?;
+        tee_pad
+            .link(&ghost)
+            .map_err(|e| format!("could not attach the virtual camera: {e:?}"))?;
+        log::debug(&format!("virtual camera on: {target:?} at {w}x{h} {format}"));
+        *current = Some((bin, tee_pad));
+        Ok(())
+    }
+
+    /// Latest peak levels in dB: (game, mic).
+    pub fn levels(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.levels[0].load(Ordering::Relaxed)),
+            f32::from_bits(self.levels[1].load(Ordering::Relaxed)),
+        )
+    }
+
+    fn update_level(&self, msg: &gst::Message, s: &gst::StructureRef) {
+        let slot = match msg.src().map(|o| o.name()) {
+            Some(n) if n == "level-game" => 0,
+            Some(n) if n == "level-mic" => 1,
+            _ => return,
+        };
+        // "peak" holds one value per channel; the meter shows the loudest.
+        let peak = s
+            .value("peak")
+            .ok()
+            .and_then(|v| v.get::<gst::glib::ValueArray>().ok())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.get::<f64>().ok())
+                    .fold(SILENT_DB as f64, f64::max)
+            })
+            .unwrap_or(SILENT_DB as f64);
+        self.levels[slot].store((peak as f32).to_bits(), Ordering::Relaxed);
+    }
+
     /// Let go of the card, so a new session can open it right away.
     pub fn release(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
@@ -711,6 +918,11 @@ impl Session {
                 match msg.view() {
                     MessageView::Eos(_) => return Ok(()),
                     MessageView::Element(e) => {
+                        // Level meter readings (no `continue`: the stats and the
+                        // --duration check below must still run).
+                        if let Some(s) = e.structure().filter(|s| s.name() == "level") {
+                            self.update_level(&msg, s);
+                        }
                         // A recording bin's own end of stream: its file is done.
                         if let Some(s) = e.structure() {
                             if s.name() == "GstBinForwarded" {
@@ -987,12 +1199,123 @@ struct AudioSource {
 }
 
 /// Audio source -> 48 kHz stereo -> volume -> tee -> [speakers].
+/// Echo cancellation for the mic: WebRTC's AEC3 (the `sonora` crate, pure Rust).
+/// The game audio is the reference for what the speakers play; whatever of it the
+/// mic picks up is subtracted from the mic. Both streams are cut into 10 ms frames of
+/// 16-bit stereo at 48 kHz, which is what AEC3 works on.
+///
+/// Returns the elements to put in the mic's path. The reference branch is attached
+/// to the game tee here.
+fn echo_canceller(
+    pipeline: &gst::Pipeline,
+    game_tee: &gst::Element,
+) -> Result<Vec<gst::Element>, String> {
+    const CHANNELS: usize = 2;
+    const FRAME: usize = 480 * CHANNELS; // 10 ms at 48 kHz
+
+    let config = sonora::StreamConfig::new(48_000, CHANNELS as u16);
+    let apm = sonora::AudioProcessing::builder()
+        .config(sonora::Config {
+            echo_canceller: Some(sonora::config::EchoCanceller::default()),
+            ..Default::default()
+        })
+        .capture_config(config)
+        .render_config(config)
+        .build();
+    let apm = Arc::new(Mutex::new(apm));
+
+    let frames = |what: &str| -> Result<Vec<gst::Element>, String> {
+        let caps = make("capsfilter")?;
+        caps.set_property(
+            "caps",
+            gst::Caps::builder("audio/x-raw")
+                .field("format", "S16LE")
+                .field("layout", "interleaved")
+                .field("rate", 48_000i32)
+                .field("channels", CHANNELS as i32)
+                .build(),
+        );
+        let split = make("audiobuffersplit").map_err(|_| {
+            format!("echo cancellation needs the audiobuffersplit plugin ({what})")
+        })?;
+        split.set_property("output-buffer-duration", gst::Fraction::new(1, 100));
+        Ok(vec![make("audioconvert")?, make("audioresample")?, caps, split])
+    };
+
+    // Reference: the game audio, as it's captured.
+    let q = make("queue")?;
+    q.set_property_from_str("leaky", "downstream");
+    let sink = make("fakesink")?;
+    sink.set_property("sync", false);
+    sink.set_property("async", false);
+    let mut branch = vec![q];
+    branch.extend(frames("game")?);
+    branch.push(sink.clone());
+    add_chain(pipeline, &branch, "echo reference")?;
+    {
+        let apm = apm.clone();
+        sink.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                    if map.len() == FRAME * 2 {
+                        let samples: Vec<i16> = map
+                            .chunks_exact(2)
+                            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                            .collect();
+                        let mut out = vec![0i16; FRAME];
+                        let _ = apm.lock().unwrap().process_render_i16(&samples, &mut out);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+    }
+    game_tee
+        .link(&branch[0])
+        .map_err(|_| "could not connect the echo reference")?;
+
+    // The mic: cleaned in place, frame by frame.
+    let mic = frames("mic")?;
+    {
+        mic.last()
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(buf) = info.buffer_mut() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Ok(mut map) = buf.make_mut().map_writable() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                if map.len() != FRAME * 2 {
+                    return gst::PadProbeReturn::Ok; // a partial last frame
+                }
+                let input: Vec<i16> = map
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                let mut output = vec![0i16; FRAME];
+                if apm.lock().unwrap().process_capture_i16(&input, &mut output).is_ok() {
+                    for (b, s) in map.chunks_exact_mut(2).zip(&output) {
+                        b.copy_from_slice(&s.to_le_bytes());
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+    }
+    log::debug("mic echo cancellation on (AEC3)");
+    Ok(mic)
+}
+
 fn add_audio_source(
     pipeline: &gst::Pipeline,
     src: gst::Element,
     what: &str,
     volume_pct: f64,
     listen: bool,
+    // Processing for this source (the mic's echo canceller), before its volume.
+    dsp: Option<Vec<gst::Element>>,
 ) -> Result<AudioSource, String> {
     let caps = make("capsfilter")?;
     caps.set_property(
@@ -1005,15 +1328,25 @@ fn add_audio_source(
     let vol = make("volume")?;
     vol.set_property("volume", volume_pct / 100.0);
     let tee = new_tee()?;
-    let chain = vec![
+    let mut chain = vec![
         src,
         make("queue")?,
         make("audioconvert")?,
         make("audioresample")?,
         caps,
-        vol.clone(),
-        tee.clone(),
     ];
+    if let Some(d) = dsp {
+        chain.extend(d);
+        chain.push(make("audioconvert")?);
+    }
+    chain.push(vol.clone());
+    // Peak level for the meters, 20 times a second.
+    let level = make("level")?;
+    level.set_property("name", format!("level-{}", if what == "mic" { "mic" } else { "game" }));
+    level.set_property("interval", 50_000_000u64);
+    level.set_property("post-messages", true);
+    chain.push(level);
+    chain.push(tee.clone());
     add_chain(pipeline, &chain, what)?;
 
     let mut speakers = None;
@@ -1396,6 +1729,7 @@ mod tests {
             record: false,
             listen_muted: false,
             mic_muted: false,
+            echo_cancel: false,
             frames: Some(Arc::new(move |f: preview::Frame| {
                 let max = f.rgba.iter().step_by(4).copied().max().unwrap_or(0);
                 assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
@@ -1430,9 +1764,11 @@ mod tests {
             fps_den: 1,
             format: "NV12".into(),
         };
-        assert_eq!(default_kbps(&m(1920, 1080, 60)), 40_000);
-        assert_eq!(default_kbps(&m(3840, 2160, 60)), 160_000);
-        assert_eq!(default_kbps(&m(1280, 720, 30)), 10_000);
+        assert_eq!(default_kbps(&m(1920, 1080, 60), Codec::H264), 40_000);
+        assert_eq!(default_kbps(&m(1920, 1080, 60), Codec::Hevc), 28_000);
+        assert_eq!(default_kbps(&m(1920, 1080, 60), Codec::Av1), 24_000);
+        assert_eq!(default_kbps(&m(3840, 2160, 60), Codec::H264), 160_000);
+        assert_eq!(default_kbps(&m(1280, 720, 30), Codec::H264), 10_000);
     }
 
     #[test]
@@ -1446,4 +1782,48 @@ mod tests {
         assert_eq!(s.lost.load(Ordering::Relaxed), 2);
         assert_eq!(s.frames.load(Ordering::Relaxed), 4);
     }
+    /// AEC3 removes a delayed copy of the game audio from the mic. Render: a mix of
+    /// tones standing in for game audio. Capture: that, 40 ms later and quieter (the
+    /// speakers into the mic). After it adapts, the echo should be mostly gone.
+    #[test]
+    fn echo_canceller_removes_game_audio() {
+        const FRAME: usize = 960; // 10 ms, stereo, 48 kHz
+        let config = sonora::StreamConfig::new(48_000, 2);
+        let mut apm = sonora::AudioProcessing::builder()
+            .config(sonora::Config {
+                echo_canceller: Some(sonora::config::EchoCanceller::default()),
+                ..Default::default()
+            })
+            .capture_config(config)
+            .render_config(config)
+            .build();
+        // Broadband noise (like music or game sound), the same per sample index.
+        let game = |n: usize| -> i16 {
+            let mut x = (n / 2) as u64 ^ 0x9E37_79B9_7F4A_7C15;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 31;
+            ((x % 16_000) as i32 - 8_000) as i16
+        };
+        let delay = 40 * 96; // 40 ms of stereo samples
+        let (mut before, mut after) = (0f64, 0f64);
+        let mut out = vec![0i16; FRAME];
+        for f in 0..600 {
+            let render: Vec<i16> = (0..FRAME).map(|i| game(f * FRAME + i)).collect();
+            let capture: Vec<i16> = (0..FRAME)
+                .map(|i| {
+                    let n = f * FRAME + i;
+                    if n >= delay { game(n - delay) / 2 } else { 0 }
+                })
+                .collect();
+            apm.process_render_i16(&render, &mut out).unwrap();
+            apm.process_capture_i16(&capture, &mut out).unwrap();
+            if f >= 400 {
+                before += capture.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+                after += out.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+            }
+        }
+        let reduction_db = 10.0 * (before / after.max(1.0)).log10();
+        assert!(reduction_db > 15.0, "echo only reduced by {reduction_db:.1} dB");
+    }
+
 }

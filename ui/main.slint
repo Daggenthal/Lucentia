@@ -24,6 +24,8 @@ component MuteButton inherits Rectangle {
     in property <image> icon;
     in property <string> text;
     in property <bool> muted: false;
+    // Live level, 0 to 1 (a meter along the bottom of the button).
+    in property <float> level: 0;
     callback clicked();
     height: 32px;
     width: row.preferred-width;
@@ -45,6 +47,25 @@ component MuteButton inherits Rectangle {
             color: root.muted ? #e04548 : Palette.foreground;
             font-size: 13px;
             vertical-alignment: center;
+        }
+    }
+    // Level meter: green, then yellow near the top, red when it's close to clipping.
+    Rectangle {
+        x: 12px;
+        y: root.height - 6px;
+        width: root.width - 24px;
+        height: 3px;
+        border-radius: 1.5px;
+        background: Palette.foreground.transparentize(0.9);
+        Rectangle {
+            x: 0;
+            width: parent.width * clamp(root.level, 0, 1);
+            border-radius: 1.5px;
+            background: root.muted ? #e04548
+                : root.level > 0.95 ? #ff4d4f
+                : root.level > 0.8 ? #e0b000
+                : #3fb950;
+            animate width { duration: 60ms; }
         }
     }
     touch := TouchArea {
@@ -115,6 +136,9 @@ export component AppWindow inherits Window {
     // Video
     in property <[string]> codecs: ["HEVC", "AV1", "H.264", "Raw (uncompressed)"];
     in-out property <int> codec-index: 0;
+    // Why the chosen codec isn't on the GPU, if it isn't.
+    in property <string> codec-note;
+    in property <bool> codec-note-error: false;
     in property <[string]> rate-modes: ["Constant bitrate (CBR)", "Variable bitrate (VBR)", "Constant quality"];
     in-out property <int> rate-mode-index: 0;
     in-out property <int> bitrate: 40;
@@ -133,6 +157,12 @@ export component AppWindow inherits Window {
     // Mute what plays on the speakers (not the recording), and mute the mic.
     in-out property <bool> listen-muted: false;
     in-out property <bool> mic-muted: false;
+    in-out property <bool> echo-cancel: false;
+    // Audio levels for the meters, 0 to 1.
+    in property <float> game-level: 0;
+    in property <float> mic-level: 0;
+    in property <string> hotkey-text: "Setting up the record hotkey…";
+    callback echo-cancel-toggled();
     // Record button text while a recording is being finished.
     in property <string> finish-text: "Finishing…";
 
@@ -175,6 +205,11 @@ export component AppWindow inherits Window {
     callback record-clicked();
     callback choose-folder();
     callback open-folder();
+    // Virtual camera: where the clean video goes (Off, PipeWire, v4l2loopback devices).
+    in property <[string]> virtual-cameras: ["Off"];
+    in-out property <int> virtual-camera-index: 0;
+    in property <string> virtual-camera-note;
+    callback virtual-camera-changed();
     // The settings panel was shown or hidden (to remember it).
     callback settings-toggled();
     in-out property <bool> settings-open: false;
@@ -305,6 +340,7 @@ export component AppWindow inherits Window {
                             icon: root.listen-muted ? @image-url("icons/speaker-off.svg") : @image-url("icons/speaker.svg");
                             text: "Audio";
                             muted: root.listen-muted;
+                            level: root.game-level;
                             clicked => { root.listen-muted = !root.listen-muted; root.audio-levels-changed(); }
                         }
                         if root.mic-index > 0: MuteButton {
@@ -312,6 +348,7 @@ export component AppWindow inherits Window {
                             icon: root.mic-muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
                             text: "Mic";
                             muted: root.mic-muted;
+                            level: root.mic-level;
                             clicked => { root.mic-muted = !root.mic-muted; root.audio-levels-changed(); }
                         }
                     }
@@ -466,6 +503,10 @@ export component AppWindow inherits Window {
                                         selected => { root.settings-changed(); }
                                     }
                                 }
+                                if root.codec-note != "": Hint {
+                                    text: root.codec-note;
+                                    color: root.codec-note-error ? #e04548 : #d09000;
+                                }
                                 Row {
                                     Label { text: "Rate control"; width: 90px; }
                                     ComboBox {
@@ -555,6 +596,14 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
+                                if root.mic-index > 0 && root.game-audio: CheckBox {
+                                    text: "Echo cancellation";
+                                    checked <=> root.echo-cancel;
+                                    toggled => { root.echo-cancel-toggled(); }
+                                }
+                                if root.mic-index > 0 && root.game-audio: Hint {
+                                    text: "Removes the game sound your mic picks up from speakers. Not needed with headphones.";
+                                }
                                 if root.mic-index > 0: Row {
                                     Label { text: "Mic sync (ms)"; width: 90px; }
                                     SpinBox {
@@ -569,6 +618,33 @@ export component AppWindow inherits Window {
                                     text: "Add a Game + Mic track (plays by default)";
                                     checked <=> root.mix-track;
                                     toggled => { root.settings-changed(); }
+                                }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Share (OBS, Discord)";
+                            VerticalLayout {
+                                spacing: 8px;
+                                Row {
+                                    Label { text: "Camera"; width: 90px; }
+                                    ComboBox {
+                                        model: root.virtual-cameras;
+                                        current-index <=> root.virtual-camera-index;
+                                        selected => { root.virtual-camera-changed(); }
+                                    }
+                                }
+                                Hint { text: root.virtual-camera-note; }
+                            }
+                        }
+
+                        GroupBox {
+                            title: "Hotkey";
+                            VerticalLayout {
+                                spacing: 6px;
+                                Hint { text: root.hotkey-text; }
+                                Hint {
+                                    text: "Also works from a script, a desktop shortcut or Steam Input: lucentia toggle-record";
                                 }
                             }
                         }

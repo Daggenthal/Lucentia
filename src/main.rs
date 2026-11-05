@@ -8,9 +8,11 @@
 //!   lucentia mics            list microphones
 //! Add --debug (or LUCENTIA_DEBUG=1) to see everything GStreamer reports.
 
+mod check;
 mod devices;
 mod encode;
 mod estimate;
+mod hotkey;
 mod log;
 mod preview;
 mod record;
@@ -30,6 +32,8 @@ Usage:
   lucentia preview [options]    Live preview with sound
   lucentia record [options]     Record to a file (Ctrl+C to stop)
   lucentia mics                 List microphones
+  lucentia toggle-record        Start or stop recording in the running app (bind it to a key)
+  lucentia check                Check which GStreamer plugins and GPU encoders are available
   lucentia finish FILE.mkv [--mp4] [--mix]
                                 Redo the finishing step on a recording: add the
                                 Game + Mic track and/or convert to MP4 (handy after a crash)
@@ -56,6 +60,7 @@ Record options:
   --mic-offset MS  Shift the mic in milliseconds to line it up with the video
   --mic-volume PCT Mic volume in percent (default 100; try 50 if it's too loud)
   --game-volume PCT  Game volume in percent (default 100)
+  --echo-cancel    With --mic, remove the game sound the mic picks up from speakers
   --no-mix-track   With --mic, leave out the \"Game + Mic\" track. By default it's the
                    first audio track (what players play), followed by separate Game
                    and Mic tracks for editing
@@ -114,6 +119,14 @@ fn main() {
 
     match cmd {
         Some("mics") => return list_mics(),
+        Some("check") => std::process::exit(if check::print() { 0 } else { 1 }),
+        Some("toggle-record") => match hotkey::send_toggle() {
+            Ok(()) => return,
+            Err(e) => {
+                log::error(&e);
+                std::process::exit(1);
+            }
+        },
         Some("finish") => return run_finish(&args[1..]),
         Some("preview") | Some("record") | Some("list") | None => {}
         Some(other) => {
@@ -325,6 +338,7 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
         frames: None,
         listen_muted: false,
         mic_muted: false,
+        echo_cancel: false,
     };
     let mut index = 1usize;
     let mbps = |v: &str, flag: &str| -> u32 {
@@ -409,6 +423,7 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
             }
             "--mix-track" => opts.mix_track = true,
             "--no-mix-track" => opts.mix_track = false,
+            "--echo-cancel" => opts.echo_cancel = true,
             "--game-volume" => {
                 opts.game_volume =
                     parse_num(next_value(&mut it, "--game-volume", "80"), "--game-volume")

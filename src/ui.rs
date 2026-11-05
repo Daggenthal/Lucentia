@@ -75,6 +75,10 @@ struct State {
     auto_restarts: Vec<std::time::Instant>,
     /// Session threads, waited for on exit so no recording is cut off.
     workers: Vec<std::thread::JoinHandle<()>>,
+    /// Frame rate to pick next time the list is filled (restoring saved settings).
+    wanted_rate: Option<f64>,
+    /// Virtual camera menu entries (None = Off).
+    cameras: Vec<Option<record::VirtualCamera>>,
 }
 
 pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
@@ -110,6 +114,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         // With the test pattern, the mic is a test tone (any name works).
         mics.push("Test tone".to_string());
     }
+    ui.set_codecs(strings(codec_labels()));
     ui.set_mics(strings(mics.iter().map(SharedString::from).collect()));
 
     let state = Rc::new(RefCell::new(State {
@@ -128,7 +133,10 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         finishing: 0,
         auto_restarts: Vec::new(),
         workers: Vec::new(),
+        wanted_rate: None,
+        cameras: Vec::new(),
     }));
+    fill_cameras(&ui, &state);
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
@@ -167,9 +175,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         }
     });
 
-    fill_resolutions(&ui, &state);
-    fill_rates(&ui, &state);
-    refresh_estimate(&ui, &state);
+    restore_settings(&ui, &state);
 
     {
         let (w, s) = (ui.as_weak(), state.clone());
@@ -179,6 +185,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             fill_rates(&ui, &s);
             refresh_estimate(&ui, &s);
             restart(&ui, &s);
+            remember(&ui, &s.borrow());
         });
     }
     {
@@ -188,6 +195,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             fill_rates(&ui, &s);
             refresh_estimate(&ui, &s);
             restart(&ui, &s);
+            remember(&ui, &s.borrow());
         });
     }
     {
@@ -201,6 +209,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             if s.borrow().session_mic != mic && !ui.get_recording() {
                 restart(&ui, &s);
             }
+            remember(&ui, &s.borrow());
         });
     }
     {
@@ -212,6 +221,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             if !ui.get_recording() {
                 restart(&ui, &s);
             }
+            remember(&ui, &s.borrow());
         });
     }
     {
@@ -229,6 +239,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
                 r.session.controls.set_listen_muted(ui.get_listen_muted());
                 r.session.controls.set_mic_muted(ui.get_mic_muted());
             }
+            remember(&ui, &s.borrow());
         });
     }
     {
@@ -252,7 +263,27 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
                 ui.set_output_folder(dir.display().to_string().into());
                 s.borrow_mut().output_dir = dir;
                 refresh_estimate(&ui, &s);
+                remember(&ui, &s.borrow());
             }
+        });
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        // The echo canceller is part of the mic's path, so the preview restarts.
+        ui.on_echo_cancel_toggled(move || {
+            let ui = w.unwrap();
+            if !ui.get_recording() {
+                restart(&ui, &s);
+            }
+            remember(&ui, &s.borrow());
+        });
+    }
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        ui.on_virtual_camera_changed(move || {
+            let ui = w.unwrap();
+            apply_camera(&ui, &s.borrow());
+            remember(&ui, &s.borrow());
         });
     }
     {
@@ -266,8 +297,65 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
         });
     }
 
+    // Record hotkey: the desktop's global shortcut, and `lucentia toggle-record`.
+    {
+        let toggle = {
+            let w = ui.as_weak();
+            move || {
+                let _ = w.upgrade_in_event_loop(|ui| {
+                    if !ui.get_busy() {
+                        ui.invoke_record_clicked();
+                    }
+                });
+            }
+        };
+        crate::hotkey::listen(toggle.clone());
+        let w = ui.as_weak();
+        crate::hotkey::register(
+            move |key| {
+                let text = match key {
+                    Some(k) => format!("Start or stop recording from anywhere with {k}."),
+                    None => "Your desktop has no global shortcuts portal. Bind the command \
+                             `lucentia toggle-record` to a key in its keyboard settings."
+                        .to_string(),
+                };
+                let _ = w.upgrade_in_event_loop(move |ui| ui.set_hotkey_text(text.into()));
+            },
+            toggle,
+        );
+    }
+
+    // Level meters: read the running session's audio peaks 20 times a second.
+    let meters = slint::Timer::default();
+    {
+        let (w, s) = (ui.as_weak(), state.clone());
+        meters.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
+            let Some(ui) = w.upgrade() else { return };
+            let (game, mic) = s
+                .borrow()
+                .running
+                .as_ref()
+                .map(|r| r.session.levels())
+                .unwrap_or((-100.0, -100.0));
+            // -60 dB (quiet) to 0 dB (full scale).
+            let fill = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+            ui.set_game_level(fill(game));
+            ui.set_mic_level(fill(mic));
+        });
+    }
+
+    // Say up front if a plugin or the GPU encoder is missing (e.g. no VA-API driver).
+    // Before the preview starts, so a preview error isn't covered up by this note.
+    let report = crate::check::run();
+    for n in &report.notes {
+        log::warn(n);
+    }
+    if let Some((text, error)) = crate::check::summary(&report) {
+        show(&ui, &text, error);
+    }
     restart(&ui, &state);
     ui.run().map_err(|e| e.to_string())?;
+    crate::hotkey::remove_socket();
 
     // Window closed: stop whatever is running and wait for every session to finish
     // its file, so a recording is never cut off.
@@ -363,6 +451,7 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         .rates
         .get(ui.get_rate_index().max(0) as usize)
         .map(|r| r.shown());
+    let previous = state.borrow_mut().wanted_rate.take().or(previous);
     let mut rates: Vec<RateChoice> = Vec::new();
     for m in modes.iter().filter(|m| m.width == w && m.height == h) {
         let fps = m.fps();
@@ -437,6 +526,84 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
     }
 }
 
+/// Fill the virtual camera menu: Off, the PipeWire camera, and any v4l2loopback
+/// devices found.
+fn fill_cameras(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let mut labels: Vec<SharedString> = vec!["Off".into(), "PipeWire camera".into()];
+    let mut cams = vec![None, Some(record::VirtualCamera::PipeWire)];
+    for (dev, name) in record::loopback_devices() {
+        labels.push(format!("{} ({name})", dev.display()).into());
+        cams.push(Some(record::VirtualCamera::Loopback(dev)));
+    }
+    ui.set_virtual_cameras(strings(labels));
+    state.borrow_mut().cameras = cams;
+}
+
+/// Turn the virtual camera on, off or over to another target, and explain it.
+fn apply_camera(ui: &AppWindow, s: &State) {
+    let target = s
+        .cameras
+        .get(ui.get_virtual_camera_index().max(0) as usize)
+        .cloned()
+        .flatten();
+    let has_loopback = s.cameras.len() > 2;
+    let note = match &target {
+        None => {
+            "Sends just the video (no Lucentia window) to OBS, Discord or a browser as a \
+             camera. Audio: add the card's audio in OBS or Discord directly."
+                .to_string()
+        }
+        Some(record::VirtualCamera::PipeWire) => {
+            let mut n = "Shows up as \"Lucentia (capture card)\" in apps that use PipeWire \
+                 cameras: OBS (Video Capture Device (PipeWire)) and browsers."
+                .to_string();
+            if !has_loopback {
+                n.push_str(
+                    " Discord's app only sees regular cameras: for it, load v4l2loopback \
+                     (sudo modprobe v4l2loopback video_nr=10 card_label=Lucentia \
+                     exclusive_caps=1) and restart Lucentia.",
+                );
+            }
+            n
+        }
+        Some(record::VirtualCamera::Loopback(d)) => format!(
+            "Every camera app (Discord, OBS, browsers) can pick {}. Higher than 1080p is \
+             scaled down to 1080p.",
+            d.display()
+        ),
+    };
+    ui.set_virtual_camera_note(note.into());
+    if let Some(r) = &s.running {
+        if let Err(e) = r.session.set_virtual_camera(target) {
+            show(ui, &e, true);
+        }
+    }
+}
+
+/// Order of the Codec menu.
+const CODECS: [Codec; 4] = [Codec::Hevc, Codec::Av1, Codec::H264, Codec::Raw];
+
+fn codec_from_index(i: i32) -> Codec {
+    CODECS.get(i.max(0) as usize).copied().unwrap_or(Codec::Hevc)
+}
+
+/// Codec menu labels, marking the ones this machine can't do on the GPU.
+fn codec_labels() -> Vec<SharedString> {
+    use crate::check::{codec_support, Support};
+    CODECS
+        .iter()
+        .map(|&c| {
+            let name = if c == Codec::Raw { "Raw (uncompressed)" } else { c.name() };
+            match codec_support(c, false) {
+                Support::Gpu => name.to_string(),
+                Support::Cpu => format!("{name} (CPU)"),
+                Support::None => format!("{name} (not available)"),
+            }
+            .into()
+        })
+        .collect()
+}
+
 /// The record options matching what's on screen.
 fn options(ui: &AppWindow, s: &State, record_on: bool) -> Option<record::Options> {
     let &(w, h) = s
@@ -444,12 +611,7 @@ fn options(ui: &AppWindow, s: &State, record_on: bool) -> Option<record::Options
         .get(ui.get_resolution_index().max(0) as usize)?;
     let rate = s.rates.get(ui.get_rate_index().max(0) as usize)?;
     let hdr = ui.get_hdr() && rate.hdr;
-    let codec = match ui.get_codec_index() {
-        1 => Codec::Av1,
-        2 => Codec::H264,
-        3 => Codec::Raw,
-        _ => Codec::Hevc,
-    };
+    let codec = codec_from_index(ui.get_codec_index());
     let kbps = (ui.get_bitrate().max(1) as u32) * 1000;
     let rate_control = match ui.get_rate_mode_index() {
         1 => RateControl::Vbr {
@@ -501,6 +663,7 @@ fn options(ui: &AppWindow, s: &State, record_on: bool) -> Option<record::Options
         frames: None,
         listen_muted: ui.get_listen_muted(),
         mic_muted: ui.get_mic_muted(),
+        echo_cancel: ui.get_echo_cancel(),
     })
 }
 
@@ -515,6 +678,12 @@ fn card<'a>(ui: &AppWindow, s: &'a State) -> Option<&'a CaptureDevice> {
 /// Recompute the size estimate and drive space for the current settings, and fill in
 /// a sensible bitrate for the mode unless the user picked their own.
 fn refresh_estimate(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    // Say why a codec isn't on the GPU (or isn't available at all).
+    let codec = codec_from_index(ui.get_codec_index());
+    let (note, error) = crate::check::codec_note(codec, ui.get_hdr())
+        .unwrap_or_default();
+    ui.set_codec_note(note.into());
+    ui.set_codec_note_error(error);
     {
         let s = state.borrow();
         if let Some(&(w, h)) = s.resolutions.get(ui.get_resolution_index().max(0) as usize) {
@@ -527,7 +696,8 @@ fn refresh_estimate(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                     fps_den: 1000,
                     format: String::new(),
                 };
-                let auto = (record::default_kbps(&mode) as f64 / 1000.0).round() as i32;
+                let codec = codec_from_index(ui.get_codec_index());
+                let auto = (record::default_kbps(&mode, codec) as f64 / 1000.0).round() as i32;
                 let user_changed = ui.get_bitrate() != s.auto_bitrate && s.auto_bitrate != 0;
                 drop(s);
                 if !user_changed {
@@ -637,6 +807,7 @@ fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         Err(e) => {
             ui.set_has_preview(false);
             ui.set_preview_message("No preview".into());
+            log::error(&format!("preview: {e}"));
             show(ui, &e, true);
             return;
         }
@@ -651,6 +822,7 @@ fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         session: session.clone(),
         generation,
     });
+    apply_camera(ui, &state.borrow());
 
     let weak = ui.as_weak();
     let worker = std::thread::spawn(move || {
@@ -1021,7 +1193,163 @@ fn load_setting(key: &str) -> Option<String> {
         .map(|(_, v)| v.trim().to_string())
 }
 
+/// Put back the settings from last time: card, mode, encoder, audio, output. Anything
+/// that no longer exists (a card or mic that's unplugged) falls back to the default.
+fn restore_settings(ui: &AppWindow, state: &Rc<RefCell<State>>) {
+    let get = |k: &str| load_setting(k);
+    let int = |k: &str| get(k).and_then(|v| v.parse::<i32>().ok());
+    let float = |k: &str| get(k).and_then(|v| v.parse::<f32>().ok());
+    let flag = |k: &str| get(k).map(|v| v == "true");
+
+    if let Some(name) = get("device") {
+        let s = state.borrow();
+        if let Some(i) = s.devs.iter().position(|d| d.name == name) {
+            ui.set_device_index(i as i32);
+        }
+    }
+    fill_resolutions(ui, state);
+    if let Some((w, h)) = get("resolution")
+        .and_then(|r| r.split_once('x').map(|(w, h)| (w.parse(), h.parse())))
+        .and_then(|(w, h)| Some((w.ok()?, h.ok()?)))
+    {
+        if let Some(i) = state.borrow().resolutions.iter().position(|&r| r == (w, h)) {
+            ui.set_resolution_index(i as i32);
+        }
+    }
+    if let Some(v) = flag("hdr") {
+        ui.set_hdr(v);
+    }
+    if let Some(v) = flag("hdr_signal") {
+        ui.set_hdr_signal(v);
+    }
+    state.borrow_mut().wanted_rate = get("fps").and_then(|v| v.parse().ok());
+    fill_rates(ui, state);
+
+    if let Some(v) = int("codec") {
+        ui.set_codec_index(v.clamp(0, 3));
+    }
+    if let Some(v) = int("rate_mode") {
+        ui.set_rate_mode_index(v.clamp(0, 2));
+    }
+    if let Some(v) = int("quality") {
+        ui.set_quality(v.clamp(0, 51));
+    }
+    if let Some(v) = flag("analysis") {
+        ui.set_analysis(v);
+    }
+    if let Some(v) = flag("game_audio") {
+        ui.set_game_audio(v);
+    }
+    if let Some(v) = float("game_volume") {
+        ui.set_game_volume(v.clamp(0.0, 200.0));
+    }
+    if let Some(name) = get("mic") {
+        if let Some(i) = state.borrow().mics.iter().position(|m| *m == name) {
+            ui.set_mic_index(i as i32);
+        }
+    }
+    if let Some(v) = float("mic_volume") {
+        ui.set_mic_volume(v.clamp(0.0, 200.0));
+    }
+    if let Some(v) = int("mic_offset") {
+        ui.set_mic_offset(v);
+    }
+    if let Some(v) = flag("mix_track") {
+        ui.set_mix_track(v);
+    }
+    if let Some(v) = flag("echo_cancel") {
+        ui.set_echo_cancel(v);
+    }
+    if let Some(v) = int("format") {
+        ui.set_format_index(v.clamp(0, 1));
+    }
+    if let Some(cam) = get("virtual_camera") {
+        let i = state.borrow().cameras.iter().position(|c| match c {
+            None => cam == "off",
+            Some(record::VirtualCamera::PipeWire) => cam == "pipewire",
+            Some(record::VirtualCamera::Loopback(d)) => d.display().to_string() == cam,
+        });
+        if let Some(i) = i {
+            ui.set_virtual_camera_index(i as i32);
+        }
+    }
+    if let Some(dir) = get("output_dir").map(PathBuf::from) {
+        ui.set_output_folder(dir.display().to_string().into());
+        state.borrow_mut().output_dir = dir;
+    }
+    refresh_estimate(ui, state);
+    // A bitrate the user typed in wins over the automatic one for the mode.
+    if let Some(v) = int("bitrate") {
+        ui.set_bitrate(v.max(1));
+        state.borrow_mut().auto_bitrate = -1;
+        refresh_estimate(ui, state);
+    }
+}
+
+/// Save what's on screen, so the next launch starts the same way.
+fn remember(ui: &AppWindow, s: &State) {
+    let b = |v: bool| if v { "true" } else { "false" }.to_string();
+    let mut items: Vec<(&str, Option<String>)> = vec![
+        ("hdr", Some(b(ui.get_hdr()))),
+        ("hdr_signal", Some(b(ui.get_hdr_signal()))),
+        ("codec", Some(ui.get_codec_index().to_string())),
+        ("rate_mode", Some(ui.get_rate_mode_index().to_string())),
+        ("quality", Some(ui.get_quality().to_string())),
+        ("analysis", Some(b(ui.get_analysis()))),
+        ("game_audio", Some(b(ui.get_game_audio()))),
+        ("game_volume", Some(ui.get_game_volume().round().to_string())),
+        ("mic_volume", Some(ui.get_mic_volume().round().to_string())),
+        ("mic_offset", Some(ui.get_mic_offset().to_string())),
+        ("mix_track", Some(b(ui.get_mix_track()))),
+        ("echo_cancel", Some(b(ui.get_echo_cancel()))),
+        ("format", Some(ui.get_format_index().to_string())),
+        ("output_dir", Some(s.output_dir.display().to_string())),
+        (
+            "virtual_camera",
+            Some(
+                match s.cameras.get(ui.get_virtual_camera_index().max(0) as usize).cloned().flatten() {
+                    None => "off".to_string(),
+                    Some(record::VirtualCamera::PipeWire) => "pipewire".to_string(),
+                    Some(record::VirtualCamera::Loopback(d)) => d.display().to_string(),
+                },
+            ),
+        ),
+        // Only a bitrate the user picked; otherwise each mode gets its own default.
+        (
+            "bitrate",
+            (s.auto_bitrate == -1).then(|| ui.get_bitrate().to_string()),
+        ),
+        (
+            "mic",
+            s.mics
+                .get(ui.get_mic_index().max(0) as usize)
+                .filter(|_| ui.get_mic_index() > 0)
+                .cloned()
+                .or(Some("None".into())),
+        ),
+    ];
+    if !s.test_source {
+        if let Some(d) = s.devs.get(ui.get_device_index().max(0) as usize) {
+            items.push(("device", Some(d.name.clone())));
+        }
+    }
+    if let Some(&(w, h)) = s.resolutions.get(ui.get_resolution_index().max(0) as usize) {
+        items.push(("resolution", Some(format!("{w}x{h}"))));
+    }
+    if let Some(r) = s.rates.get(ui.get_rate_index().max(0) as usize) {
+        items.push(("fps", Some(r.shown().to_string())));
+    }
+    if let Err(e) = save_settings(&items) {
+        log::warn(&format!("could not save settings: {e}"));
+    }
+}
+
 fn save_setting(key: &str, value: &str) -> std::io::Result<()> {
+    save_settings(&[(key, Some(value.to_string()))])
+}
+
+/// Set (Some) or remove (None) several keys in one write.
+fn save_settings(items: &[(&str, Option<String>)]) -> std::io::Result<()> {
     let path = settings_path().ok_or_else(|| std::io::Error::other("no home folder"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -1029,9 +1357,19 @@ fn save_setting(key: &str, value: &str) -> std::io::Result<()> {
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.split_once('=').map(|(k, _)| k.trim()) != Some(key))
+        .filter(|l| {
+            let k = l.split_once('=').map(|(k, _)| k.trim());
+            !items.iter().any(|(key, _)| Some(*key) == k)
+        })
         .map(String::from)
         .collect();
-    lines.push(format!("{key}={value}"));
-    std::fs::write(&path, lines.join("\n") + "\n")
+    for (key, value) in items {
+        if let Some(v) = value {
+            lines.push(format!("{key}={v}"));
+        }
+    }
+    // Write a temp file and rename, so a crash mid-write can't leave half a file.
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    std::fs::rename(&tmp, &path)
 }

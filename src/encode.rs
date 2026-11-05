@@ -69,6 +69,30 @@ pub struct VideoSettings {
     pub output_fps: Option<u32>,
 }
 
+/// GPU (VA-API) and CPU encoder element names for a codec.
+pub fn encoders(codec: Codec) -> Option<(&'static str, &'static str)> {
+    match codec {
+        Codec::H264 => Some(("vah264enc", "x264enc")),
+        Codec::Hevc => Some(("vah265enc", "x265enc")),
+        Codec::Av1 => Some(("vaav1enc", "svtav1enc")),
+        Codec::Raw => None,
+    }
+}
+
+/// Whether a GPU encoder accepts 10-bit frames (P010), going by what it advertises.
+pub fn gpu_supports_10bit(factory: &str) -> bool {
+    gst::ElementFactory::find(factory).is_some_and(|f| {
+        f.static_pad_templates().iter().any(|t| {
+            t.direction() == gst::PadDirection::Sink
+                && t.caps().iter().any(|s| {
+                    s.get::<gst::List>("format")
+                        .map(|l| l.iter().any(|v| v.get::<&str>() == Ok("P010_10LE")))
+                        .unwrap_or(s.get::<&str>("format") == Ok("P010_10LE"))
+                })
+        })
+    })
+}
+
 /// Elements that turn raw frames into an encoded stream, in order. For raw, just the
 /// conversion MKV needs.
 pub fn video_chain(v: &VideoSettings) -> Result<Vec<gst::Element>, String> {
@@ -99,15 +123,24 @@ pub fn video_chain(v: &VideoSettings) -> Result<Vec<gst::Element>, String> {
         return Err("H.264 can't record 10-bit HDR. Use --codec hevc or --codec av1.".into());
     }
 
-    let (hw, sw, parser) = match v.codec {
-        Codec::H264 => ("vah264enc", "x264enc", "h264parse"),
-        Codec::Hevc => ("vah265enc", "x265enc", "h265parse"),
-        Codec::Av1 => ("vaav1enc", "svtav1enc", "av1parse"),
-        Codec::Raw => unreachable!(),
+    let (hw, sw) = encoders(v.codec).ok_or("raw has no encoder")?;
+    let parser = match v.codec {
+        Codec::H264 => "h264parse",
+        Codec::Hevc => "h265parse",
+        _ => "av1parse",
     };
 
     let mut chain = Vec::new();
-    match make(hw) {
+    // The GPU encoder, unless it can't take 10-bit frames and this is HDR.
+    let gpu = if v.ten_bit && !gpu_supports_10bit(hw) {
+        log::warn(&format!(
+            "the GPU encoder {hw} can't do 10-bit, using {sw} on the CPU for HDR"
+        ));
+        Err(())
+    } else {
+        make(hw).map_err(|_| ())
+    };
+    match gpu {
         Ok(enc) => {
             log::debug(&format!("video encoder: {hw} (GPU)"));
             // vapostproc moves frames into GPU memory in the format the encoder wants.

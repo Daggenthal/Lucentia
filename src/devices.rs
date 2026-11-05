@@ -93,11 +93,26 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
     // doesn't pass every format through (the 4K X loses its 10-bit P010 modes).
     // Show both and keep the richer copy of each device below.
     monitor.set_show_all_devices(true);
-    monitor
-        .start()
-        .map_err(|e| format!("could not start the device monitor: {e}"))?;
-    let raw = monitor.devices();
-    monitor.stop();
+    let raw = match monitor.start() {
+        Ok(()) => {
+            let d = monitor.devices();
+            monitor.stop();
+            d
+        }
+        // One provider failing (e.g. PipeWire not running) stops the whole monitor.
+        // Fall back to asking V4L2 directly.
+        Err(e) => {
+            log::debug(&format!("device monitor failed ({e}), asking V4L2 directly"));
+            let provider = gst::DeviceProviderFactory::by_name("v4l2deviceprovider")
+                .ok_or("could not start the device monitor (no V4L2 provider)")?;
+            provider
+                .start()
+                .map_err(|e| format!("could not list capture devices: {e}"))?;
+            let d = provider.devices();
+            provider.stop();
+            d.into_iter().collect()
+        }
+    };
 
     let mut out: Vec<CaptureDevice> = Vec::new();
     for dev in raw {
@@ -118,6 +133,13 @@ pub fn list() -> Result<Vec<CaptureDevice>, String> {
         };
 
         let path = get(&["api.v4l2.path", "device.path", "object.path"]);
+
+        // Skip virtual cameras: v4l2loopback devices and Lucentia's own PipeWire
+        // camera are outputs, not capture cards.
+        if get(&["node.name"]).as_deref() == Some("lucentia") || is_virtual_video(path.as_deref()) {
+            log::debug(&format!("  skipping virtual device {}", dev.display_name()));
+            continue;
+        }
         let mut vendor = get(&["device.vendor.id", "api.v4l2.cap.vendor"]).map(norm_id);
         let mut product = get(&["device.product.id"]).map(norm_id);
         let mut serial = get(&["device.serial"]);
@@ -225,6 +247,18 @@ pub fn find_audio_for(card: &CaptureDevice) -> Option<gst::Device> {
 }
 
 /// Microphones and other audio inputs, without speaker "monitor" sources.
+/// Whether a /dev/videoN (or "v4l2:/dev/videoN") is a virtual device, like v4l2loopback.
+fn is_virtual_video(path: Option<&str>) -> bool {
+    let Some(name) = path
+        .and_then(|p| p.rsplit('/').next())
+        .filter(|n| n.starts_with("video"))
+    else {
+        return false;
+    };
+    std::fs::canonicalize(format!("/sys/class/video4linux/{name}"))
+        .is_ok_and(|p| p.to_string_lossy().contains("/devices/virtual/"))
+}
+
 pub fn list_mics() -> Vec<gst::Device> {
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Audio/Source"), None);
