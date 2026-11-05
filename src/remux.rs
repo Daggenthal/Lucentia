@@ -14,6 +14,7 @@
 use gst::prelude::*;
 use gstreamer as gst;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::encode::{self, AudioCodec};
@@ -24,12 +25,14 @@ use crate::preview::make;
 const TRACK_NAMES: [&str; 2] = ["Game", "Mic"];
 
 /// Rewrite `mkv` into `out` (MP4 if `mp4`), adding a Game + Mic track when `mix` is
-/// set (audio codec and kbit/s for it).
+/// set (audio codec and kbit/s for it). `progress` gets the overall fraction done,
+/// 0.0 to 1.0, a few times a second (not called if the length is unknown).
 pub fn finalize(
     mkv: &Path,
     out: &Path,
     mp4: bool,
     mix: Option<(AudioCodec, u32)>,
+    progress: &dyn Fn(f64),
 ) -> Result<(), String> {
     let tmp_out = sibling(out, "finishing");
     let tmp_mix = sibling(mkv, "mix.mka");
@@ -41,13 +44,21 @@ pub fn finalize(
                     log::warn("no separate Game and Mic tracks to mix, skipping the mix");
                     None
                 } else {
-                    mix_audio(mkv, &tmp_mix, codec, kbps)?;
+                    // Both stages read the whole file; the mix also decodes and
+                    // encodes, so it gets a bit more than half of the bar.
+                    mix_audio(mkv, &tmp_mix, codec, kbps, &|f| progress(f * MIX_SHARE))?;
                     Some(tmp_mix.as_path())
                 }
             }
             None => None,
         };
-        copy_into(mkv, mix_file, &tmp_out, mp4)
+        if mix_file.is_some() {
+            copy_into(mkv, mix_file, &tmp_out, mp4, &|f| {
+                progress(MIX_SHARE + f * (1.0 - MIX_SHARE))
+            })
+        } else {
+            copy_into(mkv, mix_file, &tmp_out, mp4, progress)
+        }
     })();
 
     let _ = std::fs::remove_file(&tmp_mix);
@@ -66,6 +77,9 @@ pub fn finalize(
         }
     }
 }
+
+/// Share of the progress bar for the mix stage when there is one.
+const MIX_SHARE: f64 = 0.55;
 
 /// clip.mkv + "finishing" -> clip.finishing.mkv; clip.mkv + "mix.mka" -> clip.mix.mka
 fn sibling(p: &Path, suffix: &str) -> PathBuf {
@@ -114,11 +128,19 @@ fn audio_tracks(mkv: &Path) -> Result<usize, String> {
         .set_state(gst::State::Paused)
         .map_err(|_| "could not open the recording".to_string())?;
     let bus = pipeline.bus().ok_or("no bus")?;
-    // Wait until the demuxer has seen all tracks (or the pipeline settles).
-    let _ = bus.timed_pop_filtered(
-        gst::ClockTime::from_seconds(10),
-        &[gst::MessageType::AsyncDone, gst::MessageType::Error],
-    );
+    // Wait until the demuxer has announced every track. It says so right away, but
+    // the pipeline may never settle on its own, so don't wait for that.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !*done.lock().unwrap() && std::time::Instant::now() < deadline {
+        if let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(50),
+            &[gst::MessageType::AsyncDone, gst::MessageType::Error],
+        ) {
+            if matches!(msg.view(), gst::MessageView::Error(_)) {
+                break;
+            }
+        }
+    }
     let _ = pipeline.set_state(gst::State::Null);
     let n = *count.lock().unwrap();
     log::debug(&format!(
@@ -129,7 +151,13 @@ fn audio_tracks(mkv: &Path) -> Result<usize, String> {
 }
 
 /// Stage 1: decode the first two audio tracks, mix them, encode into `dest` (.mka).
-fn mix_audio(mkv: &Path, dest: &Path, codec: AudioCodec, kbps: u32) -> Result<(), String> {
+fn mix_audio(
+    mkv: &Path,
+    dest: &Path,
+    codec: AudioCodec,
+    kbps: u32,
+    progress: &dyn Fn(f64),
+) -> Result<(), String> {
     let quote = |p: &Path| p.to_string_lossy().replace('"', "\\\"");
     let desc = format!(
         "filesrc location=\"{src}\" ! matroskademux name=d \
@@ -153,11 +181,19 @@ fn mix_audio(mkv: &Path, dest: &Path, codec: AudioCodec, kbps: u32) -> Result<()
     chain.extend(enc);
     chain.push(mmux);
     gst::Element::link_many(&chain).map_err(|_| "could not connect the mix encoder")?;
-    run_to_end(&pipeline, "mixing")
+    let demux = pipeline.by_name("d").ok_or("mix demuxer missing")?;
+    let reached = track_position(&demux);
+    run_to_end(&pipeline, "mixing", Some((&demux, reached, progress)))
 }
 
 /// Stage 2: copy video, the mix (if any) and the original audio tracks into `dest`.
-fn copy_into(mkv: &Path, mix: Option<&Path>, dest: &Path, mp4: bool) -> Result<(), String> {
+fn copy_into(
+    mkv: &Path,
+    mix: Option<&Path>,
+    dest: &Path,
+    mp4: bool,
+    progress: &dyn Fn(f64),
+) -> Result<(), String> {
     let pipeline = gst::Pipeline::new();
     let mux = if mp4 {
         let m = make("mp4mux")?;
@@ -194,6 +230,7 @@ fn copy_into(mkv: &Path, mix: Option<&Path>, dest: &Path, mp4: bool) -> Result<(
 
     // The recording: video to its pad, audio tracks each to a new pad, in order.
     let main_demux = add_reader(&pipeline, mkv)?;
+    let reached = track_position(&main_demux);
     {
         let pipeline_weak = pipeline.downgrade();
         let mux_weak = mux.downgrade();
@@ -244,7 +281,28 @@ fn copy_into(mkv: &Path, mix: Option<&Path>, dest: &Path, mp4: bool) -> Result<(
         });
     }
 
-    run_to_end(&pipeline, "finishing")
+    run_to_end(
+        &pipeline,
+        "finishing",
+        Some((&main_demux, reached, progress)),
+    )
+}
+
+/// Follow how far into the recording a demuxer has read: the latest timestamp on
+/// any of its outputs, in nanoseconds.
+fn track_position(demux: &gst::Element) -> Arc<AtomicU64> {
+    let reached = Arc::new(AtomicU64::new(0));
+    let r = reached.clone();
+    demux.connect_pad_added(move |_, pad| {
+        let r = r.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
+                r.fetch_max(pts.nseconds(), Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    });
+    reached
 }
 
 /// filesrc -> matroskademux, added to the pipeline. Returns the demuxer.
@@ -292,7 +350,13 @@ fn link_copy(
     Ok(())
 }
 
-fn run_to_end(pipeline: &gst::Pipeline, what: &str) -> Result<(), String> {
+type Tracker<'a> = (&'a gst::Element, Arc<AtomicU64>, &'a dyn Fn(f64));
+
+fn run_to_end(
+    pipeline: &gst::Pipeline,
+    what: &str,
+    tracker: Option<Tracker<'_>>,
+) -> Result<(), String> {
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|_| format!("could not start {what}"))?;
@@ -302,19 +366,32 @@ fn run_to_end(pipeline: &gst::Pipeline, what: &str) -> Result<(), String> {
     let mut last_pos = None;
     let mut stalled_since = std::time::Instant::now();
     let result = loop {
-        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_seconds(1)) {
+        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
             match msg.view() {
                 gst::MessageView::Eos(_) => break Ok(()),
                 gst::MessageView::Error(e) => {
                     log::debug(&format!("{:?}", e.debug()));
                     break Err(format!("{what}: {}", e.error()));
                 }
-                _ => continue,
+                _ => {}
             }
         }
-        let pos = pipeline.query_position::<gst::ClockTime>();
-        if pos != last_pos {
-            last_pos = pos;
+        if let Some((demux, reached, progress)) = &tracker {
+            if let Some(len) = demux
+                .query_duration::<gst::ClockTime>()
+                .filter(|d| d.nseconds() > 0)
+            {
+                let done = reached.load(Ordering::Relaxed) as f64 / len.nseconds() as f64;
+                progress(done.clamp(0.0, 1.0));
+            }
+        }
+        // Moving means either the pipeline position or the read position changed.
+        let pos = (
+            pipeline.query_position::<gst::ClockTime>(),
+            tracker.as_ref().map(|t| t.1.load(Ordering::Relaxed)),
+        );
+        if Some(pos) != last_pos {
+            last_pos = Some(pos);
             stalled_since = std::time::Instant::now();
         } else if stalled_since.elapsed().as_secs() >= 30 {
             break Err(format!("{what} stopped making progress"));

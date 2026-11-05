@@ -41,6 +41,9 @@ pub struct Options {
     pub keyframe_secs: f64,
     /// Every frame a keyframe, for frame-accurate analysis.
     pub analysis: bool,
+    /// Record at this frame rate instead of the capture's (e.g. 40 from 120 Hz,
+    /// keeping every third frame). None = the capture's rate.
+    pub record_fps: Option<u32>,
     pub audio_codec: AudioCodec,
     pub audio_kbps: u32,
     /// Microphone: a name to match, or "default".
@@ -166,16 +169,30 @@ pub fn plan(card: Option<&CaptureDevice>, opts: &Options) -> Result<Plan, String
     let rate = opts.rate.unwrap_or(RateControl::Cbr {
         kbps: default_kbps(&mode),
     });
+    let output_fps = opts
+        .record_fps
+        .filter(|&f| (f as f64) < mode.fps() - 0.01);
+    if let Some(f) = output_fps {
+        let step = mode.fps() / f as f64;
+        if (step - step.round()).abs() > 0.01 {
+            warnings.push(format!(
+                "{f} fps doesn't divide evenly into {} fps, so frame pacing will be uneven",
+                preview::fmt_fps(mode.fps())
+            ));
+        }
+    }
+    let out_fps = output_fps.map(|f| f as f64).unwrap_or(mode.fps());
     let keyframe_interval = if opts.analysis {
         1
     } else {
-        (opts.keyframe_secs * mode.fps()).round().max(1.0) as u32
+        (opts.keyframe_secs * out_fps).round().max(1.0) as u32
     };
     let video = VideoSettings {
         codec,
         rate,
         keyframe_interval,
         ten_bit: mode.ten_bit(),
+        output_fps,
     };
 
     let game_audio = opts.capture.audio;
@@ -192,7 +209,7 @@ pub fn plan(card: Option<&CaptureDevice>, opts: &Options) -> Result<Plan, String
         rate,
         width: mode.width,
         height: mode.height,
-        fps: mode.fps(),
+        fps: out_fps,
         ten_bit: mode.ten_bit(),
         audio_codec: opts.audio_codec,
         audio_kbps: opts.audio_kbps,
@@ -500,6 +517,15 @@ impl Session {
         // queue is unbounded so frames wait in memory while the encoder starts up.
         let mut inputs: Vec<(gst::Element, gst::Element, &str)> = Vec::new();
         let mut video = vec![unbounded_queue()?];
+        if let Some(fps) = plan.video.output_fps {
+            // Keep every Nth frame: drops only, never duplicates.
+            let rate = make("videorate")?;
+            rate.set_property("drop-only", true);
+            rate.set_property("max-rate", fps as i32);
+            // Start counting from the first frame, not from the session's start.
+            rate.set_property("skip-to-first", true);
+            video.push(rate);
+        }
         video.extend(encode::video_chain(&plan.video)?);
         add_to_bin(&bin, &video, "video encoder")?;
         link_to_mux(video.last().unwrap(), &mux, "Video")?;
@@ -781,22 +807,37 @@ fn lower_priority() {
     }
 }
 
+fn adds_mix(plan: &Plan, opts: &Options) -> bool {
+    opts.mix_track && opts.mic.is_some() && plan.game_audio
+}
+
+/// Whether finishing has real work to do (mix the audio, convert to MP4), rather
+/// than just closing the MKV.
+pub fn needs_stitching(plan: &Plan, opts: &Options) -> bool {
+    plan.container == Container::Mp4 || adds_mix(plan, opts)
+}
+
 /// Finish a recording's file after it stopped: mix Game + Mic and/or convert to MP4.
 /// Runs at low priority so it never competes with the capture.
-pub fn finish_recording(rec: StoppedRecording, opts: &Options) -> Finished {
+pub fn finish_recording(
+    rec: StoppedRecording,
+    opts: &Options,
+    progress: &dyn Fn(f64),
+) -> Finished {
     lower_priority();
     let plan = &rec.plan;
     let size = std::fs::metadata(&plan.mkv_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let add_mix = opts.mix_track && opts.mic.is_some() && plan.game_audio;
-    if plan.container == Container::Mp4 || add_mix {
+    let add_mix = adds_mix(plan, opts);
+    if needs_stitching(plan, opts) {
         let mix = add_mix.then_some((opts.audio_codec, opts.audio_kbps));
         match remux::finalize(
             &plan.mkv_path,
             &plan.final_path,
             plan.container == Container::Mp4,
             mix,
+            progress,
         ) {
             Ok(()) => {
                 return Finished {
@@ -904,7 +945,9 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
             }
         );
     }
-    let f = finish_recording(rec, opts);
+    let bar = log::Progress::new("stitching:");
+    let f = finish_recording(rec, opts, &|d| bar.update(d));
+    bar.done();
     if f.lost > 0 {
         log::warn(&format!(
             "{} frame(s) were lost during the recording",
@@ -1192,6 +1235,10 @@ fn print_plan(card: Option<&CaptureDevice>, plan: &Plan, opts: &Options) {
         preview::fmt_fps(mode.fps()),
         if hdr { " HDR" } else { "" }
     );
+    if let Some(f) = v.output_fps {
+        println!("{} {f} fps (every {} frame(s) of the capture)", log::bold("recording:"),
+            preview::fmt_fps(mode.fps() / f as f64));
+    }
     let rate = match (v.codec, v.rate) {
         (Codec::Raw, _) => "uncompressed".to_string(),
         (_, RateControl::Cbr { kbps }) => format!("CBR {} Mbit/s", mbit(kbps)),
@@ -1307,6 +1354,7 @@ mod tests {
             rate: None,
             keyframe_secs: 2.0,
             analysis: false,
+            record_fps: None,
             audio_codec: AudioCodec::Aac,
             audio_kbps: 320,
             mic: None,

@@ -19,6 +19,45 @@ fn color_on() -> bool {
     })
 }
 
+/// Prints "label 42% · about 10s left" on one updating line, on a terminal only.
+/// Call `done()` to end the line.
+pub struct Progress {
+    label: String,
+    started: std::time::Instant,
+    last: std::cell::Cell<i64>,
+}
+
+impl Progress {
+    pub fn new(label: &str) -> Self {
+        Progress {
+            label: label.to_string(),
+            started: std::time::Instant::now(),
+            last: std::cell::Cell::new(-1),
+        }
+    }
+
+    pub fn update(&self, done: f64) {
+        let pct = (done * 100.0) as i64;
+        if pct == self.last.get() || !std::io::stdout().is_terminal() {
+            return;
+        }
+        self.last.set(pct);
+        print!(
+            "\r\x1b[2K{} {}",
+            dim(&self.label),
+            crate::estimate::describe_progress(self.started, done)
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    pub fn done(&self) {
+        if self.last.get() >= 0 {
+            println!();
+        }
+    }
+}
+
 /// Turn debug mode on (from --debug or LUCENTIA_DEBUG=1). Call once at startup.
 pub fn init_debug(enabled: bool) {
     let _ = DEBUG.set(enabled);

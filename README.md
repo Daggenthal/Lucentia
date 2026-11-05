@@ -37,7 +37,7 @@ cargo run --release
 
 ## Usage
 
-Run `cargo run --release` to open the app. Pick your card, resolution and frame rate on the right (10-bit HDR shows up when the card offers it), set the codec and bitrate, and press Record. The size estimate updates as you change settings. When a recording finishes, Lucentia asks where to save it and what to call it (you can turn that off under Output).
+Run `cargo run --release` to open the app. Pick your card, resolution and frame rate on the right (10-bit HDR shows up when the card offers it), set the codec and bitrate, and press Record. The size estimate updates as you change settings. For 40 fps games (like 40 Hz modes on handhelds), pick "40 fps (from 120 Hz)": Lucentia captures at 120 Hz and keeps every third frame, so set the source to output 120 Hz. On the command line that's `--mode 1920x1080@120 --record-fps 40`. When a recording finishes, Lucentia asks where to save it and what to call it (you can turn that off under Output).
 
 Everything also works from the terminal:
 
@@ -64,7 +64,7 @@ cargo run --release -- mics                                     # list microphon
 
 Press Ctrl+C to stop. Recordings go to `~/Videos/Lucentia` unless you pass `--output`.
 
-With `--mic`, the Game + Mic track is mixed when you stop, from the separate Game and Mic tracks. Mixing two live devices in real time came out choppy (each device runs on its own clock); mixing the finished tracks lines them up perfectly. It takes a few seconds and the video is copied, not re-encoded. If a recording ever stops without finishing (a crash or power cut), the MKV still has the separate tracks, and `lucentia finish FILE.mkv --mix` adds the mix afterwards (`--mp4` converts it too). Use `--mic-volume` and `--game-volume` (in percent) to balance them.
+With `--mic`, the Game + Mic track is mixed when you stop, from the separate Game and Mic tracks. Mixing two live devices in real time came out choppy (each device runs on its own clock); mixing the finished tracks lines them up perfectly. This step is called stitching: the video is copied, not re-encoded, and the app shows how far along it is and about how long is left. If a recording ever stops without finishing (a crash or power cut), the MKV still has the separate tracks, and `lucentia finish FILE.mkv --mix` adds the mix afterwards (`--mp4` converts it too). Use `--mic-volume` and `--game-volume` (in percent) to balance them.
 
 **MKV or MP4?** MKV is the default and the recommendation: if the app, the system or the power cuts out mid-recording, everything up to that moment is still playable, and players and editors show the track names (Game, Mic). Pass `--format mp4` if your editor or a site only takes MP4. It still records as MKV for the same safety, then converts to MP4 when you stop, without re-encoding.
 

@@ -65,6 +65,8 @@ pub struct VideoSettings {
     /// Frames between keyframes. 1 = every frame is a keyframe (analysis mode).
     pub keyframe_interval: u32,
     pub ten_bit: bool,
+    /// Record at a lower frame rate than the capture, e.g. 40 from a 120 Hz signal.
+    pub output_fps: Option<u32>,
 }
 
 /// Elements that turn raw frames into an encoded stream, in order. For raw, just the
@@ -303,6 +305,7 @@ mod tests {
             rate: RateControl::Cbr { kbps: 40_000 },
             keyframe_interval: 120,
             ten_bit: true,
+            output_fps: None,
         };
         assert!(video_chain(&v).is_err());
     }

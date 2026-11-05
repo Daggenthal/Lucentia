@@ -109,6 +109,8 @@ export component AppWindow inherits Window {
     // Mute what plays on the speakers (not the recording), and mute the mic.
     in-out property <bool> listen-muted: false;
     in-out property <bool> mic-muted: false;
+    // Record button text while a recording is being finished.
+    in property <string> finish-text: "Finishing…";
 
     // Output
     in property <[string]> formats: ["MKV (recommended)", "MP4"];
@@ -530,7 +532,7 @@ export component AppWindow inherits Window {
                             : root.recording ? (touch.has-hover ? #c9363a : #b3272b)
                             : (touch.has-hover ? #e04548 : #d23a3d);
                         Text {
-                            text: root.busy ? "Finishing…" : root.recording ? "Stop recording" : "Record";
+                            text: root.busy ? root.finish-text : root.recording ? "Stop recording" : "Record";
                             color: #ffffff;
                             font-size: 16px;
                             font-weight: 700;

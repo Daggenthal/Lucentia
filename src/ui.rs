@@ -35,6 +35,15 @@ struct RateChoice {
     lossless: bool,
     /// A 10-bit (HDR) lossless mode exists at this rate.
     hdr: bool,
+    /// Record at this lower rate, keeping every Nth captured frame (40 from 120).
+    record_fps: Option<u32>,
+}
+
+impl RateChoice {
+    /// The frame rate the file ends up with.
+    fn shown(&self) -> f64 {
+        self.record_fps.map(|f| f as f64).unwrap_or(self.fps)
+    }
 }
 
 struct Running {
@@ -256,7 +265,7 @@ pub fn run(devs: Vec<CaptureDevice>, test_source: bool) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(300));
             if let (Some(rec), Some(opts)) = (session.stop_recording(), opts) {
                 let _ = session.wait_recording(&rec, Duration::from_secs(10));
-                let _ = record::finish_recording(rec, &opts);
+                let _ = record::finish_recording(rec, &opts, &|_| {});
             }
         }));
     }
@@ -289,6 +298,7 @@ fn device_modes(ui: &AppWindow, s: &State) -> Vec<Mode> {
             m(1920, 1080, 60, "NV12"),
             m(1920, 1080, 30, "NV12"),
             m(1920, 1080, 30, "P010_10LE"),
+            m(1280, 720, 120, "NV12"),
             m(1280, 720, 60, "NV12"),
         ];
     }
@@ -337,7 +347,7 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         .borrow()
         .rates
         .get(ui.get_rate_index().max(0) as usize)
-        .map(|r| r.fps);
+        .map(|r| r.shown());
     let mut rates: Vec<RateChoice> = Vec::new();
     for m in modes.iter().filter(|m| m.width == w && m.height == h) {
         let fps = m.fps();
@@ -348,6 +358,7 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                     fps,
                     lossless: false,
                     hdr: false,
+                    record_fps: None,
                 });
                 rates.last_mut().unwrap()
             }
@@ -357,12 +368,25 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             entry.hdr |= m.ten_bit();
         }
     }
-    rates.sort_by(|a, b| b.fps.total_cmp(&a.fps));
+    // 40 fps (Steam Deck / handheld style 40 Hz modes): capture at 120 and keep every
+    // third frame, which lines up exactly. Only offered where the card can do 120.
+    let has_40 = rates.iter().any(|r| (r.fps - 40.0).abs() < 0.01);
+    if let Some(r120) = rates.iter().find(|r| (r.fps - 120.0).abs() < 0.01) {
+        if !has_40 {
+            rates.push(RateChoice {
+                record_fps: Some(40),
+                ..r120.clone()
+            });
+        }
+    }
+    rates.sort_by(|a, b| b.shown().total_cmp(&a.shown()));
     let labels: Vec<SharedString> = rates
         .iter()
         .map(|r| {
             let fps = preview::fmt_fps(r.fps);
-            if r.lossless {
+            if let Some(f) = r.record_fps {
+                format!("{f} fps (from {fps} Hz)").into()
+            } else if r.lossless {
                 format!("{fps} fps").into()
             } else {
                 format!("{fps} fps (MJPEG)").into()
@@ -371,7 +395,7 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         .collect();
     // Keep the same frame rate when switching resolution, else prefer 60.
     let index = previous
-        .and_then(|p| rates.iter().position(|r| (r.fps - p).abs() < 0.01))
+        .and_then(|p| rates.iter().position(|r| (r.shown() - p).abs() < 0.01))
         .or_else(|| rates.iter().position(|r| (r.fps - 60.0).abs() < 0.01))
         .unwrap_or(0);
     ui.set_rates(strings(labels));
@@ -385,6 +409,10 @@ fn fill_rates(ui: &AppWindow, state: &Rc<RefCell<State>>) {
             ui.set_hdr(false);
         }
         let note = match (c.lossless, ui.get_hdr()) {
+            _ if c.record_fps.is_some() => format!(
+                "Captures at {} Hz and keeps every third frame, so set your console or PC to output 120 Hz. The preview shows all 120.",
+                preview::fmt_fps(c.fps)
+            ),
             (false, _) => "Compressed on the card (MJPEG): this rate is beyond what the USB link can carry uncompressed, so expect some quality loss.".to_string(),
             (true, true) => "Lossless 10-bit HDR from the card.".to_string(),
             (true, false) if c.hdr => "Lossless from the card. 10-bit HDR is available at this rate.".to_string(),
@@ -434,6 +462,7 @@ fn options(ui: &AppWindow, s: &State, record_on: bool) -> Option<record::Options
         rate: Some(rate_control),
         keyframe_secs: 2.0,
         analysis: ui.get_analysis(),
+        record_fps: rate.record_fps,
         audio_codec: AudioCodec::Aac,
         audio_kbps: 320,
         mic,
@@ -479,7 +508,7 @@ fn refresh_estimate(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                     kind: Kind::Lossless,
                     width: w,
                     height: h,
-                    fps_num: (r.fps * 1000.0).round() as i32,
+                    fps_num: (r.shown() * 1000.0).round() as i32,
                     fps_den: 1000,
                     format: String::new(),
                 };
@@ -634,7 +663,7 @@ fn start_session(ui: &AppWindow, state: &Rc<RefCell<State>>) {
                 let _ = tx.send(opts);
             });
             if let Ok(Some(opts)) = rx.recv() {
-                let finished = record::finish_recording(rec, &opts);
+                let finished = finish_with_progress(&weak, rec, &opts);
                 let _ =
                     weak.upgrade_in_event_loop(move |ui| finished_recording(&ui, Some(finished)));
             }
@@ -700,19 +729,55 @@ fn stop_recording(ui: &AppWindow, state: &Rc<RefCell<State>>) {
         s.finishing += 1;
     }
     ui.set_busy(true);
-    show(ui, "Finishing the recording…", false);
+    if record::needs_stitching(&rec.plan, &opts) {
+        ui.set_finish_text("Stitching…".into());
+        show(ui, "Stitching the recording together…", false);
+    } else {
+        ui.set_finish_text("Finishing…".into());
+        show(ui, "Finishing the recording…", false);
+    }
 
     let weak = ui.as_weak();
     let worker = std::thread::spawn(move || {
         if !session.wait_recording(&rec, Duration::from_secs(60)) {
             log::warn("the recording took too long to close; finishing what was written");
         }
-        let finished = record::finish_recording(rec, &opts);
+        let finished = finish_with_progress(&weak, rec, &opts);
         let _ = weak.upgrade_in_event_loop(move |ui| finished_recording(&ui, Some(finished)));
     });
     let mut s = state.borrow_mut();
     s.workers.retain(|w| !w.is_finished());
     s.workers.push(worker);
+}
+
+/// Finish a recording's file, showing "Stitching… 42% · about 10s left" in the
+/// message bar while the Game + Mic mix or the MP4 conversion runs.
+fn finish_with_progress(
+    weak: &slint::Weak<AppWindow>,
+    rec: record::StoppedRecording,
+    opts: &record::Options,
+) -> record::Finished {
+    if !record::needs_stitching(&rec.plan, opts) {
+        return record::finish_recording(rec, opts, &|_| {});
+    }
+    let _ = weak.upgrade_in_event_loop(|ui| {
+        ui.set_finish_text("Stitching…".into());
+        show(&ui, "Stitching the recording together…", false);
+    });
+    let started = std::time::Instant::now();
+    let last = std::cell::Cell::new(String::new());
+    record::finish_recording(rec, opts, &|done| {
+        let text = format!(
+            "Stitching the recording together… {}",
+            estimate::describe_progress(started, done)
+        );
+        if text != last.replace(text.clone()) {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_finish_text(format!("Stitching… {}%", (done * 100.0).floor().min(99.0)).into());
+                show(&ui, &text, false);
+            });
+        }
+    })
 }
 
 fn show_stats(ui: &AppWindow, st: &record::Stats) {

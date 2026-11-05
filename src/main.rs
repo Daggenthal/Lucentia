@@ -49,6 +49,7 @@ Record options:
   --quality Q      Constant quality, 0 (best) to 51 (worst); about 18 to 23 is good
   --keyframe SECS  Seconds between keyframes (default 2)
   --analysis       Every frame a keyframe, for frame-accurate analysis (big files)
+  --record-fps N   Record at N fps by dropping frames, e.g. --mode 1920x1080@120 --record-fps 40
   --audio C        aac, opus or pcm (default aac)
   --audio-bitrate K  Audio bitrate in kbit/s (default 320)
   --mic NAME       Also record a mic as its own track (part of its name, or default)
@@ -187,7 +188,12 @@ fn run_finish(args: &[String]) {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| AudioCodec::parse(v))
         .unwrap_or(AudioCodec::Aac);
-    match remux::finalize(&input, &out, mp4, mix.then_some((codec, 320))) {
+    let bar = log::Progress::new("stitching:");
+    let result = remux::finalize(&input, &out, mp4, mix.then_some((codec, 320)), &|d| {
+        bar.update(d)
+    });
+    bar.done();
+    match result {
         Ok(()) => log::ok(&format!("saved {}", out.display())),
         Err(e) => {
             log::error(&e);
@@ -301,6 +307,7 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
         codec: None,
         rate: None,
         keyframe_secs: 2.0,
+        record_fps: None,
         analysis: false,
         audio_codec: AudioCodec::Aac,
         audio_kbps: 320,
@@ -367,6 +374,13 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
                     fail("--quality goes from 0 (best) to 51 (worst)");
                 }
                 opts.rate = Some(RateControl::Quality { q });
+            }
+            "--record-fps" => {
+                let f: u32 = parse_num(next_value(&mut it, "--record-fps", "40"), "--record-fps");
+                if f == 0 {
+                    fail("--record-fps has to be more than 0");
+                }
+                opts.record_fps = Some(f);
             }
             "--keyframe" => {
                 opts.keyframe_secs =

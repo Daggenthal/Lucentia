@@ -121,6 +121,25 @@ pub fn describe(r: Rate) -> String {
     }
 }
 
+/// Time left for a job that started at `started` and is `done` (0..1) of the way
+/// through, assuming it keeps its pace so far. None until there's enough to go on.
+pub fn time_left(started: std::time::Instant, done: f64) -> Option<f64> {
+    let elapsed = started.elapsed().as_secs_f64();
+    if done < 0.03 || elapsed < 1.0 {
+        return None;
+    }
+    Some(elapsed / done * (1.0 - done).max(0.0))
+}
+
+/// "42% · about 1m 05s left" for a job in progress.
+pub fn describe_progress(started: std::time::Instant, done: f64) -> String {
+    let pct = (done * 100.0).floor().min(99.0) as u32;
+    match time_left(started, done) {
+        Some(left) => format!("{pct}% · about {} left", human_duration(left.ceil())),
+        None => format!("{pct}%"),
+    }
+}
+
 /// Free space in bytes on the drive holding `path`.
 #[cfg(unix)]
 pub fn free_space(path: &Path) -> Option<u64> {
