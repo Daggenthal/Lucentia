@@ -59,6 +59,8 @@ cargo run --release -- mics                                     # list microphon
 
 Press Ctrl+C to stop. Recordings go to `~/Videos/Lucentia` unless you pass `--output`.
 
+With `--mic`, the Game + Mic track is mixed when you stop, from the separate Game and Mic tracks. Mixing two live devices in real time came out choppy (each device runs on its own clock); mixing the finished tracks lines them up perfectly. It takes a few seconds and the video is copied, not re-encoded. If a recording ever stops without finishing (a crash or power cut), the MKV still has the separate tracks, and `lucentia finish FILE.mkv --mix` adds the mix afterwards (`--mp4` converts it too). Use `--mic-volume` and `--game-volume` (in percent) to balance them.
+
 **MKV or MP4?** MKV is the default and the recommendation: if the app, the system or the power cuts out mid-recording, everything up to that moment is still playable, and players and editors show the track names (Game, Mic). Pass `--format mp4` if your editor or a site only takes MP4. It still records as MKV for the same safety, then converts to MP4 when you stop, without re-encoding.
 
 Rough sizes at a fixed bitrate: 20 Mbit/s is about 9 GB per hour, 40 Mbit/s about 18 GB, 80 Mbit/s about 36 GB. Lucentia prints the estimate for your settings before it starts.

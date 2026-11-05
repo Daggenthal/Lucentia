@@ -134,6 +134,12 @@ pub(crate) fn audio_source(dev: &gst::Device) -> Result<gst::Element, String> {
         if let (Some(name), Ok(src)) = (name, make("pulsesrc")) {
             log::debug(&format!("audio: pulsesrc device={name}"));
             src.set_property("device", &name);
+            // Each audio device runs on its own clock. The default way of keeping up
+            // ("skew") skips or repeats chunks when clocks drift, which sounds choppy.
+            // Resampling by a tiny amount instead is inaudible.
+            if src.find_property("slave-method").is_some() {
+                src.set_property_from_str("slave-method", "resample");
+            }
             return Ok(src);
         }
         log::debug("audio: no node name or pulsesrc, using the device's own element");

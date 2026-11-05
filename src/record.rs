@@ -4,7 +4,10 @@
 //!                                              tee -> preview window (optional)
 //!   game audio: card audio -> 48 kHz stereo -> tee -> encoder -> mux  (track "Game")
 //!   mic:        mic -> 48 kHz stereo -> sync offset -> tee -> encoder -> mux  ("Mic")
-//!   mix:        game + mic -> audiomixer -> encoder -> mux  ("Game + Mic", optional)
+//!
+//! The "Game + Mic" track is mixed after recording, from the finished Game and Mic
+//! tracks (see remux.rs). Mixing two live devices in real time was choppy because each
+//! runs on its own clock; offline there's nothing to drift.
 //!
 //! The file is always written as MKV first: if anything crashes mid-recording, an MKV
 //! is still playable up to that point, where an unfinished MP4 is unreadable. When MP4
@@ -44,8 +47,11 @@ pub struct Options {
     pub mic: Option<String>,
     /// Delay the mic by this many milliseconds (negative = earlier).
     pub mic_offset_ms: i64,
-    /// Add a third track with game and mic mixed together.
+    /// Add a "Game + Mic" track (the first audio track, so players play it).
     pub mix_track: bool,
+    /// Volume of the game and mic audio in percent (100 = unchanged).
+    pub game_volume: f64,
+    pub mic_volume: f64,
     pub container: Container,
     pub output: Option<PathBuf>,
     pub duration: Option<f64>,
@@ -191,20 +197,6 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
     }
 
     // Audio.
-    let mut mixer: Option<gst::Element> = None;
-    if opts.mix_track && opts.mic.is_some() {
-        let m = make("audiomixer")?;
-        pipeline.add(&m).map_err(|e| e.to_string())?;
-        let mut mix_chain = vec![m.clone(), make("audioconvert")?];
-        mix_chain.extend(encode::audio_chain(opts.audio_codec, opts.audio_kbps)?);
-        add_chain(&pipeline, &mix_chain[1..], "mix track")?;
-        m.link(&mix_chain[1])
-            .map_err(|_| "could not connect the mixer")?;
-        // Linked to the muxer first, so it's the first audio track: the one players
-        // play by default, with game and mic together. The separate tracks follow.
-        link_to_mux(mix_chain.last().unwrap(), &mux, "Game + Mic")?;
-        mixer = Some(m);
-    }
 
     if game_audio {
         let src = match card {
@@ -225,7 +217,7 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
             None => Some(test_tone(440.0)?),
         };
         if let Some(src) = src {
-            add_audio_track(&pipeline, src, &mux, "Game", 0, opts, mixer.as_ref())?;
+            add_audio_track(&pipeline, src, &mux, "Game", 0, opts.game_volume, opts)?;
         }
     }
 
@@ -245,8 +237,8 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
             &mux,
             "Mic",
             opts.mic_offset_ms,
+            opts.mic_volume,
             opts,
-            mixer.as_ref(),
         )?;
     }
 
@@ -311,24 +303,30 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
         log::ok("no frames lost");
     }
 
-    if container == Container::Mp4 {
+    let add_mix = opts.mix_track && opts.mic.is_some() && game_audio;
+    if container == Container::Mp4 || add_mix {
+        let what = match (add_mix, container) {
+            (true, Container::Mp4) => "mixing Game + Mic and converting to MP4",
+            (true, Container::Mkv) => "mixing Game + Mic",
+            _ => "converting to MP4",
+        };
         println!(
-            "{} converting to MP4 (no re-encoding)",
+            "{} {what} (video is copied, not re-encoded)",
             log::dim("finishing:")
         );
-        match remux::mkv_to_mp4(&mkv_path, &final_path) {
+        let mix = add_mix.then_some((opts.audio_codec, opts.audio_kbps));
+        match remux::finalize(&mkv_path, &final_path, container == Container::Mp4, mix) {
             Ok(()) => {
-                let _ = std::fs::remove_file(&mkv_path);
-                let mp4_size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+                let out_size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
                 log::ok(&format!(
                     "saved {} ({})",
                     final_path.display(),
-                    estimate::human_bytes(mp4_size as f64)
+                    estimate::human_bytes(out_size as f64)
                 ));
             }
             Err(e) => {
                 log::warn(&format!(
-                    "MP4 conversion failed ({e}); your recording is safe as MKV"
+                    "finishing failed ({e}); your recording is safe as MKV with separate tracks"
                 ));
                 log::ok(&format!(
                     "saved {} ({})",
@@ -347,16 +345,17 @@ pub fn run(card: Option<&CaptureDevice>, opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Audio source -> 48 kHz stereo -> tee -> encoder -> mux, with a second tee branch
-/// into the mixer when there is one. A nonzero offset shifts the whole track.
+/// Audio source -> 48 kHz stereo -> [volume] -> tee -> encoder -> mux, plus a branch
+/// to the speakers for the game audio while previewing. A nonzero offset shifts the
+/// whole track.
 fn add_audio_track(
     pipeline: &gst::Pipeline,
     src: gst::Element,
     mux: &gst::Element,
     title: &str,
     offset_ms: i64,
+    volume_pct: f64,
     opts: &Options,
-    mixer: Option<&gst::Element>,
 ) -> Result<(), String> {
     let caps = make("capsfilter")?;
     caps.set_property(
@@ -373,6 +372,11 @@ fn add_audio_track(
         make("audioresample")?,
         caps,
     ];
+    if (volume_pct - 100.0).abs() > 0.01 {
+        let vol = make("volume")?;
+        vol.set_property("volume", volume_pct / 100.0);
+        chain.push(vol);
+    }
     let last = chain.last().unwrap().clone();
     let tee = make("tee")?;
     chain.push(tee.clone());
@@ -401,12 +405,6 @@ fn add_audio_track(
             .map_err(|_| "could not connect the preview audio")?;
     }
 
-    if let Some(m) = mixer {
-        let q = make("queue")?;
-        pipeline.add(&q).map_err(|e| e.to_string())?;
-        tee.link(&q).map_err(|_| "could not connect to the mixer")?;
-        q.link(m).map_err(|_| "could not connect to the mixer")?;
-    }
     Ok(())
 }
 
@@ -426,14 +424,22 @@ fn link_to_mux(from: &gst::Element, mux: &gst::Element, title: &str) -> Result<(
     let sink = mux
         .request_pad_simple(template)
         .ok_or_else(|| format!("the muxer refused the {title} track"))?;
-    src.link(&sink)
-        .map_err(|e| format!("could not connect the {title} track to the muxer: {e:?}"))?;
-    // Name the track: "Game" and "Mic" show up in players and editors (MKV only).
-    let mut tags = gst::TagList::new();
-    tags.get_mut()
+    // Name the track ("Game", "Mic") right before the muxer, so tags sent by the audio
+    // source can't override it. Players and editors show these names (MKV only).
+    let bin = from
+        .parent()
+        .and_then(|p| p.downcast::<gst::Bin>().ok())
+        .ok_or("element is not in a pipeline")?;
+    let name_it = make("taginject")?;
+    name_it.set_property("tags", format!("title=\"{title}\""));
+    bin.add(&name_it).map_err(|e| e.to_string())?;
+    from.link(&name_it)
+        .map_err(|_| format!("could not name the {title} track"))?;
+    name_it
+        .static_pad("src")
         .unwrap()
-        .add::<gst::tags::Title>(&title, gst::TagMergeMode::Replace);
-    let _ = sink.send_event(gst::event::Tag::new(tags));
+        .link(&sink)
+        .map_err(|e| format!("could not connect the {title} track to the muxer: {e:?}"))?;
     Ok(())
 }
 

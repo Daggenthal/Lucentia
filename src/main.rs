@@ -27,6 +27,9 @@ Usage:
   lucentia preview [options]    Live preview with sound
   lucentia record [options]     Record to a file (Ctrl+C to stop)
   lucentia mics                 List microphones
+  lucentia finish FILE.mkv [--mp4] [--mix]
+                                Redo the finishing step on a recording: add the
+                                Game + Mic track and/or convert to MP4 (handy after a crash)
 
 Capture options (preview and record):
   --mode WxH@FPS   Mode to open, e.g. 1920x1080@60 or 3840x2160@59.94 (default 1080p60)
@@ -47,6 +50,8 @@ Record options:
   --audio-bitrate K  Audio bitrate in kbit/s (default 320)
   --mic NAME       Also record a mic as its own track (part of its name, or default)
   --mic-offset MS  Shift the mic in milliseconds to line it up with the video
+  --mic-volume PCT Mic volume in percent (default 100; try 50 if it's too loud)
+  --game-volume PCT  Game volume in percent (default 100)
   --no-mix-track   With --mic, leave out the \"Game + Mic\" track. By default it's the
                    first audio track (what players play), followed by separate Game
                    and Mic tracks for editing
@@ -97,6 +102,7 @@ fn main() {
         .filter(|c| !c.starts_with('-'));
     match cmd {
         Some("mics") => return list_mics(),
+        Some("finish") => return run_finish(&args[1..]),
         Some("preview") | Some("record") | None => {}
         Some(other) => {
             log::error(&format!("unknown command `{other}`\n\n{USAGE}"));
@@ -138,6 +144,36 @@ fn list(devs: &[devices::CaptureDevice]) {
         log::ok(&format!("found {elgato} Elgato capture device(s)"));
     } else {
         log::warn("no Elgato card found; other capture devices still work");
+    }
+}
+
+fn run_finish(args: &[String]) {
+    let Some(input) = args.iter().find(|a| !a.starts_with('-')) else {
+        fail("finish needs a recording, e.g. lucentia finish ~/Videos/Lucentia/clip.mkv");
+    };
+    let mp4 = args.iter().any(|a| a == "--mp4");
+    let mix = args.iter().any(|a| a == "--mix");
+    if !mp4 && !mix {
+        fail("finish needs --mp4, --mix or both");
+    }
+    let input = PathBuf::from(input);
+    let out = if mp4 {
+        input.with_extension("mp4")
+    } else {
+        input.clone()
+    };
+    let codec = args
+        .iter()
+        .position(|a| a == "--audio")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| AudioCodec::parse(v))
+        .unwrap_or(AudioCodec::Aac);
+    match remux::finalize(&input, &out, mp4, mix.then_some((codec, 320))) {
+        Ok(()) => log::ok(&format!("saved {}", out.display())),
+        Err(e) => {
+            log::error(&e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -252,6 +288,8 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
         mic: None,
         mic_offset_ms: 0,
         mix_track: true,
+        game_volume: 100.0,
+        mic_volume: 100.0,
         container: record::Container::Mkv,
         output: None,
         duration: None,
@@ -334,6 +372,14 @@ fn run_record(args: &[String], devs: &[devices::CaptureDevice]) {
             }
             "--mix-track" => opts.mix_track = true,
             "--no-mix-track" => opts.mix_track = false,
+            "--game-volume" => {
+                opts.game_volume =
+                    parse_num(next_value(&mut it, "--game-volume", "80"), "--game-volume")
+            }
+            "--mic-volume" => {
+                opts.mic_volume =
+                    parse_num(next_value(&mut it, "--mic-volume", "60"), "--mic-volume")
+            }
             "--format" => {
                 opts.container = match next_value(&mut it, "--format", "mkv")
                     .to_ascii_lowercase()
