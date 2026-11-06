@@ -298,14 +298,15 @@ pub(crate) fn frames_chain(
     sink: FrameSink,
 ) -> Result<Vec<gst::Element>, String> {
     let rgba = |gl: bool| {
-        let b = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBA")
-            .field("width", width as i32)
-            .field("height", height as i32);
+        let b = gst::Caps::builder("video/x-raw").field("format", "RGBA");
         if gl {
+            // No size here: the size is set once, on the last capsfilter, so it can
+            // change while running (the pop-out window) without the two disagreeing.
             b.features(["memory:GLMemory"]).build()
         } else {
-            b.build()
+            b.field("width", width as i32)
+                .field("height", height as i32)
+                .build()
         }
     };
     let mut chain = Vec::new();
@@ -325,7 +326,6 @@ pub(crate) fn frames_chain(
             }
             chain.push(scale);
             let gl_caps = make("capsfilter")?;
-            gl_caps.set_property("name", "preview-gl-size");
             gl_caps.set_property("caps", rgba(true));
             chain.push(gl_caps);
             chain.push(down);
@@ -339,6 +339,9 @@ pub(crate) fn frames_chain(
     let caps = make("capsfilter")?;
     caps.set_property("name", "preview-size");
     caps.set_property("caps", rgba(false));
+    // When the size changes, keep accepting frames in the old size until the
+    // scaler has switched, instead of failing with "not negotiated".
+    caps.set_property_from_str("caps-change-mode", "delayed");
     chain.push(caps);
 
     let appsink = gstreamer_app::AppSink::builder()

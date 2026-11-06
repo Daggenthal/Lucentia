@@ -18,6 +18,7 @@ mod preview;
 mod record;
 mod remux;
 mod ui;
+mod xu;
 
 use devices::{Kind, Mode};
 use encode::{AudioCodec, Codec, RateControl};
@@ -33,6 +34,7 @@ Usage:
   lucentia record [options]     Record to a file (Ctrl+C to stop)
   lucentia mics                 List microphones
   lucentia toggle-record        Start or stop recording in the running app (bind it to a key)
+  lucentia xu-dump [--watch]    Read the card's vendor controls (read-only, for reverse engineering)
   lucentia check                Check which GStreamer plugins and GPU encoders are available
   lucentia finish FILE.mkv [--mp4] [--mix]
                                 Redo the finishing step on a recording: add the
@@ -120,6 +122,16 @@ fn main() {
     match cmd {
         Some("mics") => return list_mics(),
         Some("check") => std::process::exit(if check::print() { 0 } else { 1 }),
+        Some("xu-dump") => {
+            let device = devices::list()
+                .ok()
+                .and_then(|d| d.into_iter().find(|c| c.is_elgato).and_then(|c| c.path));
+            if let Err(e) = xu::run(&args[1..], device) {
+                log::error(&e);
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("toggle-record") => match hotkey::send_toggle() {
             Ok(()) => return,
             Err(e) => {

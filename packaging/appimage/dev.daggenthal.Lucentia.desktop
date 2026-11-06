@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lucentia
+GenericName=Capture Card Recorder
+Comment=Record and preview from Elgato and other UVC capture cards
+Exec=lucentia
+Icon=lucentia
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=capture;elgato;record;gameplay;

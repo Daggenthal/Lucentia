@@ -101,7 +101,7 @@ linuxdeploy-x86_64.AppImage --appdir "$appdir" \
     --executable "$bin" \
     --deploy-deps-only "$plugins" \
     --deploy-deps-only "$appdir/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" \
-    --desktop-file /src/packaging/appimage/lucentia.desktop \
+    --desktop-file /src/packaging/appimage/dev.daggenthal.Lucentia.desktop \
     --icon-file /src/assets/lucentia.svg \
     --exclude-library 'libva.so*' --exclude-library 'libva-*.so*' \
     --exclude-library 'libdrm*.so*' --exclude-library 'libgbm.so*' \

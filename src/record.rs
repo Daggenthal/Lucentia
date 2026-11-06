@@ -750,19 +750,15 @@ impl Session {
     /// video window), without restarting anything.
     pub fn set_preview_width(&self, max_width: i32) {
         let (w, h) = preview::preview_size_max(&self.plan.mode, max_width);
-        for (name, gl) in [("preview-gl-size", true), ("preview-size", false)] {
-            if let Some(f) = self.pipeline.by_name(name) {
-                let b = gst::Caps::builder("video/x-raw")
+        if let Some(f) = self.pipeline.by_name("preview-size") {
+            f.set_property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
                     .field("format", "RGBA")
                     .field("width", w as i32)
-                    .field("height", h as i32);
-                let caps = if gl {
-                    b.features(["memory:GLMemory"]).build()
-                } else {
-                    b.build()
-                };
-                f.set_property("caps", caps);
-            }
+                    .field("height", h as i32)
+                    .build(),
+            );
         }
         log::debug(&format!("preview frames now {w}x{h}"));
     }

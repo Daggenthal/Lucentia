@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use crate::log;
 
 const SHORTCUT_ID: &str = "toggle-record";
+/// Lucentia's app ID (reverse domain of daggenthal.dev), matching its .desktop file.
+pub const APP_ID: &str = "dev.daggenthal.Lucentia";
 /// The trigger Lucentia suggests (ShadowPlay's record key), in the XDG shortcuts
 /// format. The desktop can change it.
 const PREFERRED: &str = "ALT+F9";
@@ -79,6 +81,13 @@ pub fn register(
             use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
             use futures_util::StreamExt;
 
+            // Portals need to know which app is asking; outside Flatpak, register our
+            // app ID first (otherwise: "An app id is required").
+            if let Ok(id) = ashpd::AppID::try_from(APP_ID) {
+                if let Err(e) = ashpd::register_host_app(id).await {
+                    log::debug(&format!("could not register the app ID: {e}"));
+                }
+            }
             let portal = GlobalShortcuts::new().await?;
             let session = portal.create_session(Default::default()).await?;
             let shortcut = NewShortcut::new(SHORTCUT_ID, "Start or stop recording")
